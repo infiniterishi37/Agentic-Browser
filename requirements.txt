@@ -1,0 +1,11 @@
+langchain-google-genai
+langchain-openai
+langgraph
+langchain
+openai
+playwright
+beautifulsoup4
+python-dotenv
+pydantic
+websockets
+html2text
