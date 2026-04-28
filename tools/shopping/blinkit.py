@@ -14,21 +14,22 @@ from tools.browser import browser_manager
 BLINKIT_DELIVERY_ADDRESS = "AIT College Pune"
 
 
-async def shop_on_blinkit(items: list[str]) -> dict:
+async def shop_on_blinkit(items: list[str], page=None) -> dict:
     """
     Automates shopping on Blinkit for a list of items.
     Returns a dict with 'added' and 'unavailable' item lists.
     """
     print(f"\n[Blinkit] Starting shopping run for: {items}")
+    page = page or browser_manager.page
     added_items = []
     unavailable_items = []
 
     print("[Blinkit] Navigating to blinkit.com...")
-    await browser_manager.navigate("https://blinkit.com")
+    await page.goto("https://blinkit.com", wait_until="domcontentloaded", timeout=30000)
     await asyncio.sleep(4)
 
     # Set delivery location before doing anything else
-    await _set_delivery_location(BLINKIT_DELIVERY_ADDRESS)
+    await _set_delivery_location(BLINKIT_DELIVERY_ADDRESS, page=page)
 
     for item_name in items:
         print(f"\n[Blinkit] Processing item: {item_name}")
@@ -37,20 +38,20 @@ async def shop_on_blinkit(items: list[str]) -> dict:
             query = urllib.parse.quote_plus(item_name)
             search_url = f"https://blinkit.com/s/?q={query}"
             print(f"   Searching: {search_url}")
-            await browser_manager.navigate(search_url)
-            await browser_manager.page.wait_for_load_state("domcontentloaded")
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_load_state("domcontentloaded")
             await asyncio.sleep(3)
 
             # If location modal reappears after navigation, set it again
-            if await _location_modal_visible():
+            if await _location_modal_visible(page=page):
                 print("   Location modal reappeared — setting address again...")
-                await _set_delivery_location(BLINKIT_DELIVERY_ADDRESS)
-                await browser_manager.navigate(search_url)
-                await browser_manager.page.wait_for_load_state("domcontentloaded")
+                await _set_delivery_location(BLINKIT_DELIVERY_ADDRESS, page=page)
+                await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_load_state("domcontentloaded")
                 await asyncio.sleep(3)
 
             # Check for no results
-            page_text = (await browser_manager.page.content()).lower()
+            page_text = (await page.content()).lower()
             no_result_phrases = [
                 "no products found", "no results", "we couldn't find",
                 "not available in your area",
@@ -61,11 +62,11 @@ async def shop_on_blinkit(items: list[str]) -> dict:
                 continue
 
             # Scroll so product cards render
-            await browser_manager.page.evaluate("window.scrollBy(0, 300)")
+            await page.evaluate("window.scrollBy(0, 300)")
             await asyncio.sleep(1.5)
 
             # Try clicking the ADD / + button on the first product card
-            added = await _click_first_add_button(browser_manager.page)
+            added = await _click_first_add_button(page)
 
             if added:
                 added_items.append(item_name)
@@ -82,11 +83,11 @@ async def shop_on_blinkit(items: list[str]) -> dict:
 
     # ── Click cart icon (top-right) to open the cart panel ──────────────
     print("\n[Blinkit] Opening cart panel...")
-    await _click_blinkit_cart_icon()
+    await _click_blinkit_cart_icon(page=page)
 
     # ── Rechecker ─────────────────────────────────────────────────────────
     print("\n[Blinkit] Running cart rechecker...")
-    verified = await _recheck_blinkit_cart(added_items)
+    verified = await _recheck_blinkit_cart(added_items, page=page)
     truly_unavailable = list(set(unavailable_items) | set(verified["missing_from_cart"]))
 
     result = {
@@ -104,11 +105,12 @@ async def shop_on_blinkit(items: list[str]) -> dict:
 
 # ─── Cart Icon ───────────────────────────────────────────────────────────────
 
-async def _click_blinkit_cart_icon() -> None:
+async def _click_blinkit_cart_icon(page=None) -> None:
     """
     Clicks the cart / basket button in the Blinkit header (top-right).
     Tries several selectors in order; falls back to navigating to /cart.
     """
+    page = page or browser_manager.page
     cart_selectors = [
         # Playwright semantic locators
         ("role", "link",     "Cart"),
@@ -120,7 +122,7 @@ async def _click_blinkit_cart_icon() -> None:
     # Try semantic locators first
     for kind, role, name in cart_selectors:
         try:
-            loc = browser_manager.page.get_by_role(role, name=name)
+            loc = page.get_by_role(role, name=name)
             if await loc.first.is_visible(timeout=1500):
                 await loc.first.click(timeout=3000)
                 await asyncio.sleep(2)
@@ -141,8 +143,8 @@ async def _click_blinkit_cart_icon() -> None:
         "[aria-label*='Cart']",
     ]:
         try:
-            if await browser_manager.page.is_visible(sel, timeout=1500):
-                await browser_manager.page.click(sel, timeout=3000)
+            if await page.is_visible(sel, timeout=1500):
+                await page.click(sel, timeout=3000)
                 await asyncio.sleep(2)
                 print("   ✅ Opened cart panel via CSS selector")
                 return
@@ -151,7 +153,7 @@ async def _click_blinkit_cart_icon() -> None:
 
     # JS fallback: click first visible link/button whose text contains "cart"
     try:
-        clicked = await browser_manager.page.evaluate("""() => {
+        clicked = await page.evaluate("""() => {
             const candidates = [
                 ...document.querySelectorAll('a, button, [role="button"]'),
             ];
@@ -174,14 +176,15 @@ async def _click_blinkit_cart_icon() -> None:
 
     # Final fallback: navigate directly
     print("   ⚠️ Could not click cart icon — navigating to /cart")
-    await browser_manager.navigate("https://blinkit.com/cart")
+    await page.goto("https://blinkit.com/cart", wait_until="domcontentloaded", timeout=30000)
     await asyncio.sleep(2)
 
 
 # ─── Location Setup ──────────────────────────────────────────────────────────
 
-async def _location_modal_visible() -> bool:
+async def _location_modal_visible(page=None) -> bool:
     """Returns True if the Blinkit location/address modal is currently shown."""
+    page = page or browser_manager.page
     indicators = [
         "text=Please provide your delivery location",
         "[placeholder*='search delivery location']",
@@ -190,14 +193,14 @@ async def _location_modal_visible() -> bool:
     ]
     for sel in indicators:
         try:
-            if await browser_manager.page.locator(sel).first.is_visible(timeout=1500):
+            if await page.locator(sel).first.is_visible(timeout=1500):
                 return True
         except Exception:
             pass
     return False
 
 
-async def _set_delivery_location(address: str) -> None:
+async def _set_delivery_location(address: str, page=None) -> None:
     """
     Types the address into Blinkit's location search field and selects
     the first dropdown suggestion.
@@ -205,6 +208,7 @@ async def _set_delivery_location(address: str) -> None:
     Primary selector confirmed from live DOM inspection:
         div[class*='LocationSearchList__LocationDetailContainer']
     """
+    page = page or browser_manager.page
     print(f"[Blinkit] Setting delivery location to: '{address}'")
 
     # ── 1. Find and click the search input ───────────────────────────────
@@ -220,13 +224,13 @@ async def _set_delivery_location(address: str) -> None:
     typed = False
     for sel in input_selectors:
         try:
-            loc = browser_manager.page.locator(sel)
+            loc = page.locator(sel)
             if await loc.first.is_visible(timeout=2000):
                 await loc.first.click(timeout=2000)
                 await asyncio.sleep(0.5)
                 # keyboard.type() fires real JS input events → triggers autocomplete
                 # page.fill() bypasses these events and breaks autocomplete
-                await browser_manager.page.keyboard.type(address, delay=80)
+                await page.keyboard.type(address, delay=80)
                 typed = True
                 print(f"   Typed address into: {sel}")
                 break
@@ -241,8 +245,8 @@ async def _set_delivery_location(address: str) -> None:
     SUGGESTION_SEL = "div[class*='LocationSearchList__LocationDetailContainer']"
 
     try:
-        await browser_manager.page.wait_for_selector(SUGGESTION_SEL, timeout=6000)
-        first_item = browser_manager.page.locator(SUGGESTION_SEL).first
+        await page.wait_for_selector(SUGGESTION_SEL, timeout=6000)
+        first_item = page.locator(SUGGESTION_SEL).first
         if await first_item.is_visible(timeout=3000):
             await first_item.click(timeout=3000)
             print("   ✅ Selected first location suggestion")
@@ -253,7 +257,7 @@ async def _set_delivery_location(address: str) -> None:
 
     # ── 3. Fallback: JS scan for any visible LocationSearchList element ───
     try:
-        clicked = await browser_manager.page.evaluate("""() => {
+        clicked = await page.evaluate("""() => {
             const candidates = [
                 ...document.querySelectorAll('[class*="LocationSearchList"]'),
                 ...document.querySelectorAll('[class*="LocationDetail"]'),
@@ -279,9 +283,9 @@ async def _set_delivery_location(address: str) -> None:
 
     # ── 4. Last resort: ArrowDown + Enter ────────────────────────────────
     try:
-        await browser_manager.page.keyboard.press("ArrowDown")
+        await page.keyboard.press("ArrowDown")
         await asyncio.sleep(0.4)
-        await browser_manager.page.keyboard.press("Enter")
+        await page.keyboard.press("Enter")
         await asyncio.sleep(3)
         print("   Selected suggestion via ArrowDown+Enter (last resort)")
     except Exception:
@@ -350,14 +354,15 @@ async def _click_first_add_button(page) -> bool:
 
 # ─── Rechecker ───────────────────────────────────────────────────────────────
 
-async def _recheck_blinkit_cart(expected_items: list[str]) -> dict:
+async def _recheck_blinkit_cart(expected_items: list[str], page=None) -> dict:
     """Verifies expected items are present in the Blinkit cart."""
     if not expected_items:
         return {"confirmed_in_cart": [], "missing_from_cart": []}
+    page = page or browser_manager.page
     try:
-        await browser_manager.navigate("https://blinkit.com/cart")
+        await page.goto("https://blinkit.com/cart", wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(3)
-        cart_text = (await browser_manager.page.content()).lower()
+        cart_text = (await page.content()).lower()
         confirmed, missing = [], []
         for item in expected_items:
             keywords = item.lower().split()

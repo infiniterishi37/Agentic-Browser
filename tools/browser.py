@@ -134,6 +134,40 @@ CHAT_WIDGET_JS = """
         #agentic-chat-messages::-webkit-scrollbar-thumb {
             background: rgba(139,92,246,0.3); border-radius: 10px;
         }
+        .agentic-chat-section {
+            border-bottom: 1px solid rgba(139,92,246,0.12);
+            background: rgba(0,0,0,0.12);
+        }
+        .agentic-chat-toggle {
+            width: 100%;
+            border: none;
+            background: transparent;
+            color: #c9c9f9;
+            font-size: 12px;
+            font-weight: 600;
+            letter-spacing: 0.3px;
+            text-align: left;
+            padding: 9px 14px;
+            cursor: pointer;
+        }
+        .agentic-chat-section-body {
+            display: block;
+        }
+        #agentic-chat-state-wrap {
+            display: none;
+            max-height: 130px;
+            overflow: auto;
+            padding: 0 14px 12px;
+        }
+        #agentic-chat-state {
+            margin: 0;
+            color: #c4f1d4;
+            font-size: 11px;
+            line-height: 1.45;
+            white-space: pre-wrap;
+            word-break: break-word;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        }
         .agentic-msg {
             padding: 10px 14px;
             border-radius: 14px;
@@ -209,6 +243,33 @@ CHAT_WIDGET_JS = """
             align-items: center;
             gap: 8px;
         }
+        #agentic-chat-footer {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            margin-top: 2px;
+        }
+        #agentic-chat-loop-wrap {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        #agentic-chat-loop-wrap label {
+            color: #c8c8ef;
+            font-size: 11px;
+        }
+        #agentic-chat-loop-limit {
+            width: 56px;
+            height: 28px;
+            border-radius: 8px;
+            border: 1px solid rgba(139,92,246,0.25);
+            background: rgba(255,255,255,0.07);
+            color: #e0e0ff;
+            font-size: 12px;
+            padding: 0 8px;
+            outline: none;
+        }
         #agentic-chat-input {
             flex: 1;
             height: 40px;
@@ -255,7 +316,18 @@ CHAT_WIDGET_JS = """
             <div class="dot"></div>
             <span>Agentic Browser</span>
         </div>
-        <div id="agentic-chat-messages"></div>
+        <div class="agentic-chat-section">
+            <button id="agentic-chat-toggle-messages" class="agentic-chat-toggle" type="button">Messages ▾</button>
+            <div id="agentic-chat-messages-wrap" class="agentic-chat-section-body">
+                <div id="agentic-chat-messages"></div>
+            </div>
+        </div>
+        <div class="agentic-chat-section">
+            <button id="agentic-chat-toggle-state" class="agentic-chat-toggle" type="button">State ▸</button>
+            <div id="agentic-chat-state-wrap" class="agentic-chat-section-body">
+                <pre id="agentic-chat-state"></pre>
+            </div>
+        </div>
         <div id="agentic-chat-input-area">
             <div id="agentic-chat-controls">
                 <select id="agentic-chat-provider" class="agentic-chat-select">
@@ -270,6 +342,12 @@ CHAT_WIDGET_JS = """
                     <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
                 </button>
             </div>
+            <div id="agentic-chat-footer">
+                <div id="agentic-chat-loop-wrap">
+                    <label for="agentic-chat-loop-limit">Loop limit</label>
+                    <input id="agentic-chat-loop-limit" type="number" min="1" step="1" value="3"/>
+                </div>
+            </div>
         </div>
     </div>
     `;
@@ -279,11 +357,16 @@ CHAT_WIDGET_JS = """
     const bubble = document.getElementById('agentic-chat-bubble');
     const panel = document.getElementById('agentic-chat-panel');
     const msgs = document.getElementById('agentic-chat-messages');
+    const msgsWrap = document.getElementById('agentic-chat-messages-wrap');
+    const stateWrap = document.getElementById('agentic-chat-state-wrap');
+    const statePre = document.getElementById('agentic-chat-state');
+    const toggleMessagesBtn = document.getElementById('agentic-chat-toggle-messages');
+    const toggleStateBtn = document.getElementById('agentic-chat-toggle-state');
     const input = document.getElementById('agentic-chat-input');
+    const loopLimitInput = document.getElementById('agentic-chat-loop-limit');
     const sendBtn = document.getElementById('agentic-chat-send');
     const providerSelect = document.getElementById('agentic-chat-provider');
     const modelSelect = document.getElementById('agentic-chat-model');
-    let statusEl = null;
 
     const MODEL_OPTIONS = {
         groq: [
@@ -302,6 +385,12 @@ CHAT_WIDGET_JS = """
     let ws = null;
     let wsRetries = 0;
     let isPanelOpen = false;
+    const PANEL_KEY = 'agentic-chat-panel-open';
+    const LOOP_LIMIT_KEY = 'agentic-chat-loop-limit';
+    const MSGS_DROPDOWN_KEY = 'agentic-chat-messages-open';
+    const STATE_DROPDOWN_KEY = 'agentic-chat-state-open';
+    let latestAgentState = {};
+    let latestUiState = {};
 
     function getStored(key, fallback = '') {
         try {
@@ -316,6 +405,28 @@ CHAT_WIDGET_JS = """
         try {
             window.localStorage.setItem(key, value);
         } catch (e) {}
+    }
+
+    function setSectionOpen(section, open) {
+        if (section === 'messages') {
+            msgsWrap.style.display = open ? 'block' : 'none';
+            toggleMessagesBtn.textContent = open ? 'Messages ▾' : 'Messages ▸';
+            setStored(MSGS_DROPDOWN_KEY, open ? 'open' : 'closed');
+            return;
+        }
+        if (section === 'state') {
+            stateWrap.style.display = open ? 'block' : 'none';
+            toggleStateBtn.textContent = open ? 'State ▾' : 'State ▸';
+            setStored(STATE_DROPDOWN_KEY, open ? 'open' : 'closed');
+        }
+    }
+
+    function renderState() {
+        const statePayload = {
+            ui_state: latestUiState,
+            agent_state: latestAgentState,
+        };
+        statePre.textContent = JSON.stringify(statePayload, null, 2);
     }
 
     function populateModels(provider, selectedModel = '') {
@@ -334,8 +445,13 @@ CHAT_WIDGET_JS = """
 
     const savedProvider = getStored('agentic-chat-provider', 'google');
     const savedModel = getStored('agentic-chat-model', 'gemini-2.5-flash-lite');
+    const savedLoopLimit = parseInt(getStored(LOOP_LIMIT_KEY, '3'), 10);
+    const savedPanelOpenRaw = getStored(PANEL_KEY, 'closed');
+    const hasSavedPanelState = savedPanelOpenRaw === 'open' || savedPanelOpenRaw === 'closed';
+    const savedPanelOpen = savedPanelOpenRaw === 'open';
     providerSelect.value = MODEL_OPTIONS[savedProvider] ? savedProvider : 'google';
     populateModels(providerSelect.value, savedModel);
+    loopLimitInput.value = String(Number.isFinite(savedLoopLimit) && savedLoopLimit > 0 ? savedLoopLimit : 3);
 
     providerSelect.addEventListener('change', () => {
         populateModels(providerSelect.value);
@@ -347,6 +463,7 @@ CHAT_WIDGET_JS = """
                 panel_open: isPanelOpen,
                 provider: providerSelect.value,
                 model: modelSelect.value,
+                loop_limit: parseInt(loopLimitInput.value || '3', 10) || 3,
             }));
         }
     });
@@ -360,13 +477,28 @@ CHAT_WIDGET_JS = """
                 panel_open: isPanelOpen,
                 provider: providerSelect.value,
                 model: modelSelect.value,
+                loop_limit: parseInt(loopLimitInput.value || '3', 10) || 3,
+            }));
+        }
+    });
+    loopLimitInput.addEventListener('change', () => {
+        let value = parseInt(loopLimitInput.value || '3', 10);
+        if (!Number.isFinite(value) || value < 1) value = 3;
+        loopLimitInput.value = String(value);
+        setStored(LOOP_LIMIT_KEY, String(value));
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                type: 'ui_state',
+                panel_open: isPanelOpen,
+                provider: providerSelect.value,
+                model: modelSelect.value,
+                loop_limit: value,
             }));
         }
     });
 
     function renderHistory(messages) {
         msgs.innerHTML = '';
-        statusEl = null;
         if (!Array.isArray(messages)) return;
         messages.forEach((m) => {
             const t = m && m.type ? m.type : 'agent';
@@ -385,6 +517,7 @@ CHAT_WIDGET_JS = """
                     panel_open: isPanelOpen,
                     provider: providerSelect.value,
                     model: modelSelect.value,
+                    loop_limit: parseInt(loopLimitInput.value || '3', 10) || 3,
                 }));
             };
             ws.onmessage = (evt) => {
@@ -395,18 +528,34 @@ CHAT_WIDGET_JS = """
                         return;
                     }
                     if (data.type === 'ui_state') {
-                        setPanelOpen(Boolean(data.panel_open), false);
+                        latestUiState = {
+                            panel_open: Boolean(data.panel_open),
+                            provider: data.provider || providerSelect.value,
+                            model: data.model || modelSelect.value,
+                            loop_limit: data.loop_limit || parseInt(loopLimitInput.value || '3', 10) || 3,
+                        };
+                        renderState();
+                        if (!hasSavedPanelState) {
+                            setPanelOpen(Boolean(data.panel_open), false);
+                        }
                         const provider = (data.provider || '').toLowerCase();
                         const model = data.model || '';
-                        if (MODEL_OPTIONS[provider]) {
+                        const loopLimit = parseInt(String(data.loop_limit || ''), 10);
+                        if (!getStored('agentic-chat-provider', '') && MODEL_OPTIONS[provider]) {
                             providerSelect.value = provider;
                             populateModels(provider, model);
                             setStored('agentic-chat-provider', provider);
                             setStored('agentic-chat-model', modelSelect.value);
                         }
+                        if (!getStored(LOOP_LIMIT_KEY, '') && Number.isFinite(loopLimit) && loopLimit >= 1) {
+                            loopLimitInput.value = String(loopLimit);
+                            setStored(LOOP_LIMIT_KEY, String(loopLimit));
+                        }
                         return;
                     }
                     if (data.type === 'agent_state') {
+                        latestAgentState = data;
+                        renderState();
                         return;
                     }
                     addMessage(data.content, data.type || 'agent');
@@ -425,27 +574,12 @@ CHAT_WIDGET_JS = """
 
     function addMessage(text, type) {
         if (type === 'response') type = 'agent';
-        if (type === 'status') {
-            if (!statusEl || !statusEl.isConnected) {
-                statusEl = document.createElement('div');
-                statusEl.className = 'agentic-msg status';
-                msgs.appendChild(statusEl);
-            }
-            statusEl.textContent = text;
-            msgs.scrollTop = msgs.scrollHeight;
-            return;
-        }
 
         const div = document.createElement('div');
         div.className = 'agentic-msg ' + type;
         div.textContent = text;
         msgs.appendChild(div);
         msgs.scrollTop = msgs.scrollHeight;
-
-        // Clear/update status block context once we get a terminal message.
-        if ((type === 'system' || type === 'agent') && statusEl && statusEl.isConnected) {
-            statusEl = null;
-        }
     }
 
     function sendMessage() {
@@ -456,11 +590,18 @@ CHAT_WIDGET_JS = """
         const selectedModel = modelSelect.value;
         setStored('agentic-chat-provider', selectedProvider);
         setStored('agentic-chat-model', selectedModel);
+        let selectedLoopLimit = parseInt(loopLimitInput.value || '3', 10);
+        if (!Number.isFinite(selectedLoopLimit) || selectedLoopLimit < 1) {
+            selectedLoopLimit = 3;
+            loopLimitInput.value = '3';
+        }
+        setStored(LOOP_LIMIT_KEY, String(selectedLoopLimit));
         if (ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
                 content: text,
                 provider: selectedProvider,
                 model: selectedModel,
+                loop_limit: selectedLoopLimit,
             }));
         } else {
             addMessage(text, 'user');
@@ -471,10 +612,17 @@ CHAT_WIDGET_JS = """
 
     function setPanelOpen(open, sync = true) {
         isPanelOpen = open;
+        setStored(PANEL_KEY, open ? 'open' : 'closed');
         panel.classList.toggle('open', open);
         panel.style.display = open ? 'flex' : 'none';
         if (sync && ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'ui_state', panel_open: open }));
+            ws.send(JSON.stringify({
+                type: 'ui_state',
+                panel_open: open,
+                provider: providerSelect.value,
+                model: modelSelect.value,
+                loop_limit: parseInt(loopLimitInput.value || '3', 10) || 3,
+            }));
         }
         if (open && !ws) {
             connectWS();
@@ -494,7 +642,17 @@ CHAT_WIDGET_JS = """
     input.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') sendMessage();
     });
+    toggleMessagesBtn.addEventListener('click', () => {
+        setSectionOpen('messages', msgsWrap.style.display === 'none');
+    });
+    toggleStateBtn.addEventListener('click', () => {
+        setSectionOpen('state', stateWrap.style.display === 'none');
+    });
 
+    setSectionOpen('messages', getStored(MSGS_DROPDOWN_KEY, 'open') === 'open');
+    setSectionOpen('state', getStored(STATE_DROPDOWN_KEY, 'closed') === 'open');
+    renderState();
+    setPanelOpen(savedPanelOpen, false);
     connectWS();
 })();
 """

@@ -10,7 +10,7 @@ load_dotenv()
 
 # --- Workflow Definition ---
 
-MAX_REPLANNING_CYCLES = 5
+MAX_REPLANNING_CYCLES = 3
 
 def should_continue(state: AgentState) -> Literal["planner", "__end__"]:
     if state.get("task_complete"):
@@ -19,8 +19,11 @@ def should_continue(state: AgentState) -> Literal["planner", "__end__"]:
     
     # Check replanning limit from orchestration
     replanning = state.get("replanning_count", 0)
-    if replanning >= MAX_REPLANNING_CYCLES:
-        print(f"\n⚠️ Max replanning cycles ({MAX_REPLANNING_CYCLES}) reached. Stopping.")
+    loop_limit = int(state.get("loop_limit", MAX_REPLANNING_CYCLES) or MAX_REPLANNING_CYCLES)
+    if loop_limit < 1:
+        loop_limit = 1
+    if replanning >= loop_limit:
+        print(f"\n⚠️ Max replanning cycles ({loop_limit}) reached. Stopping.")
         return "__end__"
 
     # Check orchestration confidence

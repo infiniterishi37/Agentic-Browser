@@ -7,7 +7,7 @@ Usage:
     python demo.py amazon                       # Amazon only
     python demo.py flipkart                     # Flipkart only
     python demo.py blinkit                      # Blinkit only
-    python demo.py coordinator                  # All three + open all carts
+    python demo.py coordinator                  # Parallel run on all 3 + open all carts
 
 Edit SHOPPING_LIST below to change what gets searched in non-search modes.
 """
@@ -51,15 +51,24 @@ async def run(target: str = "coordinator"):
 
         elif target == "search":
             # Full Google-first flow: query → items → all 3 platforms → comparison
-            from tools.shopping.coordinator import run_shopping_flow
+            from tools.shopping.coordinator import (
+                run_shopping_flow,
+                build_chat_summary,
+            )
+            from tools.shopping.google_items import search_items_on_google
             query = " ".join(sys.argv[2:]) or " ".join(SHOPPING_LIST)
-            await run_shopping_flow(query)
+            results = await run_shopping_flow(query)
+            resolved_items = await search_items_on_google(query)
+            print("\n📌 Final Summary")
+            print(build_chat_summary(results, resolved_items))
 
         else:  # coordinator (default)
-            from tools.shopping.coordinator import run_all_shops
+            from tools.shopping.coordinator import run_all_shops, build_chat_summary
             results = await run_all_shops(SHOPPING_LIST)
             for platform, data in results.items():
                 _print_result(data)
+            print("\n📌 Final Summary")
+            print(build_chat_summary(results, SHOPPING_LIST))
 
         print("\n✅  Demo finished. The browser stays open so you can inspect the carts.")
         print("    Press Ctrl+C or close the terminal when done.\n")

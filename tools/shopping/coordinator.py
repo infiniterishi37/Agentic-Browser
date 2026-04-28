@@ -21,6 +21,7 @@ from tools.shopping.amazon import shop_on_amazon
 from tools.shopping.flipkart import shop_on_flipkart
 from tools.shopping.blinkit import shop_on_blinkit
 from tools.shopping.google_items import search_items_on_google
+from tools.chat_server import chat_server
 
 
 CART_URLS = {
@@ -48,27 +49,46 @@ async def run_all_shops(items: list[str]) -> dict:
     print("═" * 60)
     print(f"  Items: {items}")
     print("═" * 60)
+    await chat_server.send_to_browser(
+        f"I am starting your shopping review across Amazon, Flipkart, and Blinkit for {len(items)} items.",
+        "status",
+    )
 
-    results = {}
+    context = browser_manager.page.context
+    pages = {
+        "amazon": browser_manager.page,
+        "flipkart": await context.new_page(),
+        "blinkit": await context.new_page(),
+    }
 
-    # ── Phase 1: Amazon ──────────────────────────────────────────────────
-    print("\n[Coordinator] ▶ Phase 1 — Amazon")
-    results["amazon"] = await shop_on_amazon(items)
-
-    # ── Phase 2: Flipkart ────────────────────────────────────────────────
-    print("\n[Coordinator] ▶ Phase 2 — Flipkart")
-    results["flipkart"] = await shop_on_flipkart(items)
-
-    # ── Phase 3: Blinkit ─────────────────────────────────────────────────
-    print("\n[Coordinator] ▶ Phase 3 — Blinkit")
-    results["blinkit"] = await shop_on_blinkit(items)
+    print("\n[Coordinator] ▶ Phase 1 — Parallel run on Amazon + Flipkart + Blinkit")
+    await chat_server.send_to_browser(
+        "Running all three websites in parallel now. I will aggregate the results once all three finish.",
+        "status",
+    )
+    amazon_task = shop_on_amazon(items, page=pages["amazon"])
+    flipkart_task = shop_on_flipkart(items, page=pages["flipkart"])
+    blinkit_task = shop_on_blinkit(items, page=pages["blinkit"])
+    amazon_res, flipkart_res, blinkit_res = await asyncio.gather(
+        amazon_task, flipkart_task, blinkit_task
+    )
+    results = {
+        "amazon": amazon_res,
+        "flipkart": flipkart_res,
+        "blinkit": blinkit_res,
+    }
 
     # ── Phase 4: Open all three carts ────────────────────────────────────
-    print("\n[Coordinator] ▶ Phase 4 — Opening all carts")
+    print("\n[Coordinator] ▶ Phase 2 — Opening all carts")
+    await chat_server.send_to_browser(
+        "Parallel run is complete. Opening all carts so you can review platform-level outcomes.",
+        "status",
+    )
     await _open_all_carts()
 
     # ── Summary Report ───────────────────────────────────────────────────
     _print_summary(results)
+    await chat_server.send_to_browser(build_chat_summary(results, items), "agent")
 
     return results
 
@@ -121,6 +141,48 @@ def _print_summary(results: dict) -> None:
     else:
         print("\n  🎉  All items were successfully added on all platforms!")
     print("═" * 60 + "\n")
+
+
+def build_chat_summary(results: dict, all_items: list[str]) -> str:
+    """Create a concise chat summary with totals and best affordability pick."""
+    total_requested = len(all_items)
+    lines = [
+        "Shopping review complete across 3 websites.",
+        f"Total requested items: {total_requested}",
+    ]
+
+    scores: dict[str, int] = {}
+    for platform, data in results.items():
+        added = data.get("added", [])
+        unavailable = data.get("unavailable", [])
+        scores[platform] = len(added)
+        lines.append(
+            f"- {platform.capitalize()}: added {len(added)}, unavailable {len(unavailable)}"
+        )
+
+    cheapest_platform, cheapest_reason = _choose_cheapest_platform(results, scores)
+    lines.append(f"Cheapest option: {cheapest_platform.capitalize()} ({cheapest_reason}).")
+    return "\n".join(lines)
+
+
+def _choose_cheapest_platform(results: dict, scores: dict[str, int]) -> tuple[str, str]:
+    """
+    Pick cheapest platform if explicit totals are available; otherwise fallback to
+    best fulfillment score as proxy and clearly label it as an estimate.
+    """
+    totals: dict[str, float] = {}
+    for platform, data in results.items():
+        total = data.get("estimated_total")
+        if isinstance(total, (int, float)) and total > 0:
+            totals[platform] = float(total)
+
+    if totals:
+        platform = min(totals, key=totals.get)
+        return platform, f"estimated cart total {totals[platform]:.2f}"
+
+    platform = max(scores, key=scores.get) if scores else "amazon"
+    score = scores.get(platform, 0)
+    return platform, f"estimated by highest fulfillment score {score}"
 
 
 def _print_comparison_table(results: dict, all_items: list[str]) -> None:
@@ -198,15 +260,27 @@ async def run_shopping_flow(
 
     # ── Step 1: Resolve item list ─────────────────────────────────────────
     print("\n[Shopping Flow] ▶ Step 1 — Google search for items")
+    await chat_server.send_to_browser(
+        "First step: resolving your shopping list from the query before platform execution.",
+        "status",
+    )
     items = await search_items_on_google(
         query, llm_provider=llm_provider, llm_model=llm_model
     )
     print(f"[Shopping Flow] ✅ Items resolved: {items}")
+    await chat_server.send_to_browser(
+        f"Item resolution complete. I found {len(items)} items and will start parallel shopping now.",
+        "status",
+    )
 
     # ── Step 2: Shop all three platforms ─────────────────────────────────
     results = await run_all_shops(items)
 
     # ── Step 3: Comparison table ──────────────────────────────────────────
     _print_comparison_table(results, items)
+    await chat_server.send_to_browser(
+        "Review completed. Sharing final summary with totals and cheapest option now.",
+        "status",
+    )
 
     return results

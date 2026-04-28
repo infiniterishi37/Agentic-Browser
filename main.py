@@ -74,7 +74,10 @@ async def _run_graph(initial_state: dict) -> None:
 
 
 async def run_task(
-    user_input: str, llm_provider: str = "", llm_model: str = ""
+    user_input: str,
+    llm_provider: str = "",
+    llm_model: str = "",
+    loop_limit: int = 3,
 ) -> None:
     """Execute a single user task through the orchestrated agent pipeline."""
     run_id = uuid.uuid4().hex[:8]
@@ -83,23 +86,38 @@ async def run_task(
     print(f"{'─' * 50}")
 
     provider, model = _resolve_provider_and_model(llm_provider, llm_model)
+    if loop_limit < 1:
+        loop_limit = 1
     await chat_server.send_to_browser(
-        f"🧠 Starting task {run_id} with {provider}/{model}...", "status"
+        (
+            f"Starting now: I understood your request and I'm spinning up the workflow "
+            f"with {provider}/{model} (task id: {run_id}, loop limit: {loop_limit})."
+        ),
+        "status",
     )
     await chat_server.update_agent_state(
         running=True,
         run_id=run_id,
         provider=provider,
         model=model,
+        loop_limit=loop_limit,
         last_error="",
     )
 
     session_id = ""
     token_id = ""
     try:
+        await chat_server.send_to_browser(
+            "Quick check: validating provider configuration and connectivity.",
+            "status",
+        )
         _validate_provider_config(provider)
 
         # Start orchestration session
+        await chat_server.send_to_browser(
+            "Great, configuration is valid. I'm creating an execution session.",
+            "status",
+        )
         ctx = await orchestration_engine.start_task(user_input)
         session_id = ctx["session_id"]
         token_id = ctx["token_id"]
@@ -120,11 +138,20 @@ async def run_task(
             "replanning_count": 0,
             "llm_provider": provider,
             "llm_model": model,
+            "loop_limit": loop_limit,
         }
 
+        await chat_server.send_to_browser(
+            "Plan is ready. I am now running planner, browser actions, and critique checks.",
+            "status",
+        )
         await _run_graph(initial_state)
 
         # Finalize orchestration
+        await chat_server.send_to_browser(
+            "Finalizing outputs and wrapping up this run.",
+            "status",
+        )
         await orchestration_engine.finalize(session_id, token_id)
 
         # Send completion to browser chat
@@ -136,6 +163,7 @@ async def run_task(
             run_id=run_id,
             provider=provider,
             model=model,
+            loop_limit=loop_limit,
             last_error="",
         )
     except Exception as e:
@@ -149,6 +177,7 @@ async def run_task(
             run_id=run_id,
             provider=provider,
             model=model,
+            loop_limit=loop_limit,
             last_error=f"{type(e).__name__}: {e}",
         )
 
@@ -157,6 +186,14 @@ async def run_task(
 async def check_chat_messages() -> dict | None:
     """Non-blocking check for messages from the browser chat widget."""
     return await chat_server.get_message(timeout=0.1)
+
+
+def _safe_loop_limit(value, default: int = 3) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        return default
+    return parsed if parsed >= 1 else default
 
 
 async def run_agent():
@@ -210,6 +247,7 @@ async def run_agent():
                         chat_msg.get("content", ""),
                         chat_msg.get("provider", ""),
                         chat_msg.get("model", ""),
+                        _safe_loop_limit(chat_msg.get("loop_limit", 3)),
                     )
                     continue
 

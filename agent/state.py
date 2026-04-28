@@ -14,6 +14,7 @@ class AgentState(TypedDict):
     orchestration_place: str
     epistemic_confidence: float
     replanning_count: int
+    loop_limit: int
     # LLM override fields (set from chat panel selection)
     llm_provider: str
     llm_model: str

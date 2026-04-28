@@ -2,7 +2,7 @@ import asyncio
 from tools.browser import browser_manager
 
 
-async def shop_on_amazon(items: list[str]) -> dict:
+async def shop_on_amazon(items: list[str], page=None) -> dict:
     """
     Automates shopping on Amazon for a list of items.
     Returns a dict with 'added' and 'unavailable' item lists.
@@ -12,8 +12,13 @@ async def shop_on_amazon(items: list[str]) -> dict:
     unavailable_items = []
 
     # 1. Open Amazon
+    page = page or browser_manager.page
+
+    async def _goto(url: str) -> None:
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
     print("[Amazon] Navigating to Amazon.in...")
-    await browser_manager.navigate("https://www.amazon.in")
+    await _goto("https://www.amazon.in")
     await asyncio.sleep(2)
 
     for item_name in items:
@@ -21,16 +26,16 @@ async def shop_on_amazon(items: list[str]) -> dict:
         try:
             # ── Search ──────────────────────────────────────────────────────
             search_box = "input[id='twotabsearchtextbox']"
-            await browser_manager.page.fill(search_box, item_name, timeout=5000)
-            await browser_manager.page.keyboard.press("Enter")
+            await page.fill(search_box, item_name, timeout=5000)
+            await page.keyboard.press("Enter")
             await asyncio.sleep(5)
 
             # ── Click first result ────────────────────────────────────────
             print("   Clicking product link...")
-            context = browser_manager.page.context
+            context = page.context
             initial_count = len(context.pages)
 
-            await browser_manager.page.click(
+            await page.click(
                 "div[data-component-type='s-search-result'] a.a-link-normal",
                 timeout=2000,
             )
@@ -38,7 +43,7 @@ async def shop_on_amazon(items: list[str]) -> dict:
 
             # ── Handle new tab ───────────────────────────────────────────
             new_tab_opened = False
-            target_page = browser_manager.page
+            target_page = page
 
             if len(context.pages) > initial_count:
                 new_tab_opened = True
@@ -106,7 +111,7 @@ async def shop_on_amazon(items: list[str]) -> dict:
             # ── Cleanup tab ──────────────────────────────────────────────
             if new_tab_opened:
                 await target_page.close()
-                await browser_manager.page.bring_to_front()
+                await page.bring_to_front()
 
             await asyncio.sleep(2)
 
@@ -116,7 +121,7 @@ async def shop_on_amazon(items: list[str]) -> dict:
 
     # ── Rechecker: verify cart items ─────────────────────────────────────
     print("\n[Amazon] Running cart rechecker...")
-    verified_result = await _recheck_amazon_cart(added_items)
+    verified_result = await _recheck_amazon_cart(added_items, page=page)
     truly_unavailable = list(
         set(unavailable_items) | set(verified_result["missing_from_cart"])
     )
@@ -134,7 +139,7 @@ async def shop_on_amazon(items: list[str]) -> dict:
     return result
 
 
-async def _recheck_amazon_cart(expected_items: list[str]) -> dict:
+async def _recheck_amazon_cart(expected_items: list[str], page=None) -> dict:
     """
     Navigates to the Amazon cart and verifies each expected item is present.
     Returns confirmed and missing item lists.
@@ -142,11 +147,16 @@ async def _recheck_amazon_cart(expected_items: list[str]) -> dict:
     if not expected_items:
         return {"confirmed_in_cart": [], "missing_from_cart": []}
 
+    page = page or browser_manager.page
     try:
-        await browser_manager.navigate("https://www.amazon.in/gp/cart/view.html")
+        await page.goto(
+            "https://www.amazon.in/gp/cart/view.html",
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
         await asyncio.sleep(3)
 
-        cart_content = await browser_manager.page.content()
+        cart_content = await page.content()
         cart_text = cart_content.lower()
 
         confirmed = []

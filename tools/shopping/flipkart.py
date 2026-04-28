@@ -16,22 +16,23 @@ import urllib.parse
 from tools.browser import browser_manager
 
 
-async def shop_on_flipkart(items: list[str]) -> dict:
+async def shop_on_flipkart(items: list[str], page=None) -> dict:
     """
     Automates shopping on Flipkart for a list of items.
     Returns a dict with 'added' and 'unavailable' item lists.
     """
     print(f"\n[Flipkart] Starting shopping run for: {items}")
+    page = page or browser_manager.page
     added_items = []
     unavailable_items = []
 
     print("[Flipkart] Navigating to Flipkart.com...")
-    await browser_manager.navigate("https://www.flipkart.com")
+    await page.goto("https://www.flipkart.com", wait_until="domcontentloaded", timeout=30000)
     await asyncio.sleep(3)
 
     # Dismiss login popup by text
     try:
-        close = browser_manager.page.get_by_role("button", name="✕")
+        close = page.get_by_role("button", name="✕")
         await close.click(timeout=2000)
         await asyncio.sleep(1)
         print("[Flipkart] Dismissed login popup.")
@@ -44,13 +45,13 @@ async def shop_on_flipkart(items: list[str]) -> dict:
             # ── 1. Search ────────────────────────────────────────────────
             query = urllib.parse.quote_plus(item_name)
             search_url = f"https://www.flipkart.com/search?q={query}"
-            await browser_manager.navigate(search_url)
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
             # Wait for page to fully settle before reading content
-            await browser_manager.page.wait_for_load_state("domcontentloaded")
+            await page.wait_for_load_state("domcontentloaded")
             await asyncio.sleep(3)
 
             # ── 2. Check for empty results ────────────────────────────────
-            page_text = (await browser_manager.page.content()).lower()
+            page_text = (await page.content()).lower()
             if "no results found" in page_text or "0 results" in page_text:
                 print(f"   ❌ No results for '{item_name}'")
                 unavailable_items.append(item_name)
@@ -59,12 +60,12 @@ async def shop_on_flipkart(items: list[str]) -> dict:
             # ── 3. Try Add-to-Cart directly from search grid ──────────────
             # Some Flipkart categories (groceries) show ATC on the grid card.
             print("   Trying direct Add-to-Cart from search grid...")
-            added = await _click_atc_by_text(browser_manager.page)
+            added = await _click_atc_by_text(page)
 
             # ── 4. If not added, open product page via goto() ─────────────
             if not added:
                 print("   Navigating to first product page...")
-                product_href = await _get_first_product_href(browser_manager.page)
+                product_href = await _get_first_product_href(page)
 
                 if not product_href:
                     print(f"   ❌ No product link found for '{item_name}'")
@@ -73,23 +74,23 @@ async def shop_on_flipkart(items: list[str]) -> dict:
 
                 # Navigate properly so Playwright awaits the page load
                 print(f"   Opening: {product_href[:80]}...")
-                await browser_manager.page.goto(
+                await page.goto(
                     product_href, wait_until="domcontentloaded", timeout=30000
                 )
                 await asyncio.sleep(4)
 
                 # Check if out of stock on the product page
-                pdp_text = (await browser_manager.page.content()).lower()
+                pdp_text = (await page.content()).lower()
                 if "currently out of stock" in pdp_text or "sold out" in pdp_text:
                     print(f"   ❌ '{item_name}' is out of stock on this listing")
                     unavailable_items.append(item_name)
                     continue
 
                 # Scroll to make lazy-loaded buttons appear
-                await browser_manager.page.evaluate("window.scrollBy(0, 500)")
+                await page.evaluate("window.scrollBy(0, 500)")
                 await asyncio.sleep(2)
 
-                added = await _click_atc_by_text(browser_manager.page)
+                added = await _click_atc_by_text(page)
 
             if added:
                 added_items.append(item_name)
@@ -106,7 +107,7 @@ async def shop_on_flipkart(items: list[str]) -> dict:
 
     # ── Rechecker ─────────────────────────────────────────────────────────
     print("\n[Flipkart] Running cart rechecker...")
-    verified = await _recheck_flipkart_cart(added_items)
+    verified = await _recheck_flipkart_cart(added_items, page=page)
     truly_unavailable = list(set(unavailable_items) | set(verified["missing_from_cart"]))
 
     result = {
@@ -211,14 +212,15 @@ async def _click_atc_by_text(page) -> bool:
     return False
 
 
-async def _recheck_flipkart_cart(expected_items: list[str]) -> dict:
+async def _recheck_flipkart_cart(expected_items: list[str], page=None) -> dict:
     """Verifies expected items are present in the Flipkart cart."""
     if not expected_items:
         return {"confirmed_in_cart": [], "missing_from_cart": []}
+    page = page or browser_manager.page
     try:
-        await browser_manager.navigate("https://www.flipkart.com/viewcart")
+        await page.goto("https://www.flipkart.com/viewcart", wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(3)
-        cart_text = (await browser_manager.page.content()).lower()
+        cart_text = (await page.content()).lower()
         confirmed, missing = [], []
         for item in expected_items:
             keywords = item.lower().split()

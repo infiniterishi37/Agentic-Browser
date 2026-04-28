@@ -14,7 +14,7 @@ A web browser agent powered by LangGraph, Google Gemini, and Playwright.
    - Get a key from [Google AI Studio](https://aistudio.google.com/app/apikey)
    - Copy `.env.example` to `.env`
    - Paste your key in `.env`
-
+`
 ## Usage
 Run the agent:
 ```bash

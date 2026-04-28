@@ -42,11 +42,15 @@ class ChatServer:
             if self.selected_provider == "google"
             else os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
         )
+        self.loop_limit: int = int(os.getenv("AGENT_LOOP_LIMIT", "3"))
+        if self.loop_limit < 1:
+            self.loop_limit = 3
         self.agent_state: Dict[str, Any] = {
             "running": False,
             "run_id": "",
             "provider": self.selected_provider,
             "model": self.selected_model,
+            "loop_limit": self.loop_limit,
             "last_error": "",
         }
 
@@ -86,6 +90,7 @@ class ChatServer:
             "panel_open": self.panel_open,
             "provider": self.selected_provider,
             "model": self.selected_model,
+            "loop_limit": self.loop_limit,
         }))
         await websocket.send(json.dumps({
             "type": "agent_state",
@@ -103,15 +108,27 @@ class ChatServer:
                         self.panel_open = bool(data.get("panel_open", False))
                         provider = (data.get("provider") or "").strip().lower()
                         model = (data.get("model") or "").strip()
+                        loop_limit_raw = data.get("loop_limit")
+                        loop_limit = self.loop_limit
+                        if isinstance(loop_limit_raw, (int, float, str)):
+                            try:
+                                parsed = int(loop_limit_raw)
+                                if parsed >= 1:
+                                    loop_limit = parsed
+                            except Exception:
+                                pass
                         if provider in {"google", "groq"}:
                             self.selected_provider = provider
                         if model:
                             self.selected_model = model
+                        self.loop_limit = loop_limit
+                        self.agent_state["loop_limit"] = self.loop_limit
                         await self._broadcast_payload({
                             "type": "ui_state",
                             "panel_open": self.panel_open,
                             "provider": self.selected_provider,
                             "model": self.selected_model,
+                            "loop_limit": self.loop_limit,
                         })
                         continue
 
@@ -119,22 +136,35 @@ class ChatServer:
                     if content:
                         provider = (data.get("provider") or self.selected_provider).strip().lower()
                         model = (data.get("model") or self.selected_model).strip()
+                        loop_limit_raw = data.get("loop_limit", self.loop_limit)
+                        loop_limit = self.loop_limit
+                        if isinstance(loop_limit_raw, (int, float, str)):
+                            try:
+                                parsed = int(loop_limit_raw)
+                                if parsed >= 1:
+                                    loop_limit = parsed
+                            except Exception:
+                                pass
                         if provider in {"google", "groq"}:
                             self.selected_provider = provider
                         if model:
                             self.selected_model = model
+                        self.loop_limit = loop_limit
+                        self.agent_state["loop_limit"] = self.loop_limit
 
                         logger.info(
-                            "Chat message from browser: %s | provider=%s | model=%s",
+                            "Chat message from browser: %s | provider=%s | model=%s | loop_limit=%s",
                             content,
                             self.selected_provider,
                             self.selected_model,
+                            self.loop_limit,
                         )
                         # Queue as dict with optional provider/model
                         msg_data = {
                             "content": content,
                             "provider": self.selected_provider,
                             "model": self.selected_model,
+                            "loop_limit": self.loop_limit,
                         }
                         await self._broadcast_payload({
                             "type": "user",
@@ -153,6 +183,7 @@ class ChatServer:
                             "panel_open": self.panel_open,
                             "provider": self.selected_provider,
                             "model": self.selected_model,
+                            "loop_limit": self.loop_limit,
                         })
                 except json.JSONDecodeError:
                     # Treat as plain text
@@ -163,6 +194,7 @@ class ChatServer:
                             "content": text,
                             "provider": self.selected_provider,
                             "model": self.selected_model,
+                            "loop_limit": self.loop_limit,
                         })
         except Exception as e:
             logger.debug(f"Chat client {client_id} disconnected: {e}")
@@ -190,7 +222,7 @@ class ChatServer:
         """Store durable chat history entries."""
         msg_type = payload.get("type", "")
         # Keep only durable conversation messages in history.
-        if msg_type not in {"user", "agent", "response", "system"}:
+        if msg_type not in {"user", "agent", "response", "system", "status"}:
             return
         content = str(payload.get("content", "")).strip()
         if not content:
@@ -206,6 +238,7 @@ class ChatServer:
         run_id: str = "",
         provider: str = "",
         model: str = "",
+        loop_limit: int | None = None,
         last_error: str = "",
     ) -> None:
         """Update and broadcast current shared agent state."""
@@ -215,6 +248,8 @@ class ChatServer:
             self.agent_state["provider"] = provider
         if model:
             self.agent_state["model"] = model
+        if loop_limit is not None and loop_limit >= 1:
+            self.agent_state["loop_limit"] = int(loop_limit)
         if last_error or not running:
             self.agent_state["last_error"] = last_error
         await self._broadcast_payload({
