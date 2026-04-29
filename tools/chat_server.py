@@ -53,6 +53,19 @@ class ChatServer:
             "loop_limit": self.loop_limit,
             "last_error": "",
         }
+        # Flight assistant conversational state (single-session memory).
+        self.flight_booking_state: Dict[str, Any] = {
+            "active": False,
+            "stage": "idle",
+            "origin": "",
+            "destination": "",
+            "depart_date": "",
+            "return_date": "",
+            "trip_type": "oneway",
+            "adults": 1,
+            "auto_book": False,
+            "options": [],
+        }
 
     async def start(self) -> None:
         """Start the WebSocket server in the background."""
