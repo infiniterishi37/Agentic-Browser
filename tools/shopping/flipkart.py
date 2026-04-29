@@ -25,6 +25,7 @@ async def shop_on_flipkart(items: list[str], page=None) -> dict:
     page = page or browser_manager.page
     added_items = []
     unavailable_items = []
+    extracted_data = {}
 
     print("[Flipkart] Navigating to Flipkart.com...")
     await page.goto("https://www.flipkart.com", wait_until="domcontentloaded", timeout=30000)
@@ -90,10 +91,84 @@ async def shop_on_flipkart(items: list[str], page=None) -> dict:
                 await page.evaluate("window.scrollBy(0, 500)")
                 await asyncio.sleep(2)
 
+                # ── Extract Product Data ─────────────────────────────────
+                product_url = page.url
+                title = "N/A"
+                price = "N/A"
+                image_url = ""
+                try:
+                    extracted = await page.evaluate("""() => {
+                        let title = "N/A";
+                        let price = "N/A";
+                        let img = "";
+                        
+                        // Title: usually span with class B_NuCI or VU-ZEz or yhB1nd
+                        let tNode = document.querySelector('span.B_NuCI, span.VU-ZEz, span.yhB1nd');
+                        if (!tNode) {
+                            // Fallback to the largest text element in the first column
+                            let headings = Array.from(document.querySelectorAll('h1 span, h1'));
+                            if (headings.length > 0) tNode = headings[headings.length - 1]; // deepest element
+                        }
+                        if (tNode) title = tNode.innerText || tNode.textContent;
+                        
+                        // Clean up title (remove large blocks of unrelated text if caught)
+                        if (title && title.length > 150) {
+                            title = title.substring(0, 150) + "...";
+                        }
+                        
+                        // Price: usually div with class Nx9bqj or _30jeq3
+                        let pNode = document.querySelector('div.Nx9bqj.CxhGGd, div._30jeq3._16Jk6d');
+                        if (!pNode) {
+                            // Find first element containing ₹ that looks like a price and is isolated
+                            const els = Array.from(document.querySelectorAll('*'));
+                            for (let el of els) {
+                                let t = el.innerText || '';
+                                if (t.trim().startsWith('₹') && t.length < 15 && el.children.length === 0) {
+                                    pNode = el; break;
+                                }
+                            }
+                        }
+                        if (pNode) price = pNode.innerText || pNode.textContent;
+                        
+                        // Image: first img inside a container that looks like product image
+                        let iNode = document.querySelector('div.CXW8mj img, img.DByuf4, img._396cs4, img.vU5WPq');
+                        if (!iNode) {
+                            // fall back to largest image
+                            let maxArea = 0;
+                            const imgs = document.querySelectorAll('img');
+                            imgs.forEach(i => {
+                                const rect = i.getBoundingClientRect();
+                                const area = rect.width * rect.height;
+                                if (area > maxArea && i.src && !i.src.includes('logo')) {
+                                    maxArea = area;
+                                    iNode = i;
+                                }
+                            });
+                        }
+                        if (iNode) img = iNode.src;
+                        
+                        return { title, price, img };
+                    }""")
+                    
+                    title = extracted.get("title", "N/A")
+                    price = extracted.get("price", "N/A")
+                    image_url = extracted.get("img", "")
+                except Exception as e:
+                    print(f"   ⚠️ Could not extract some Flipkart details: {e}")
+
+                extracted_data[item_name] = {
+                    "query": item_name,
+                    "title": title.strip() if title != "N/A" else item_name,
+                    "price": price.strip() if price != "N/A" else "N/A",
+                    "image_url": image_url or "",
+                    "url": product_url
+                }
+
                 added = await _click_atc_by_text(page)
 
             if added:
-                added_items.append(item_name)
+                # Use extracted data if available, otherwise just query
+                added_items.append(extracted_data.get(item_name, {"query": item_name, "title": item_name, "price": "N/A", "image_url": "", "url": page.url}))
                 print(f"   ✅ Added '{item_name}' to Flipkart cart")
             else:
                 unavailable_items.append(item_name)
@@ -107,19 +182,21 @@ async def shop_on_flipkart(items: list[str], page=None) -> dict:
 
     # ── Rechecker ─────────────────────────────────────────────────────────
     print("\n[Flipkart] Running cart rechecker...")
-    verified = await _recheck_flipkart_cart(added_items, page=page)
+    expected_queries = [item["query"] for item in added_items]
+    verified = await _recheck_flipkart_cart(expected_queries, page=page)
+    confirmed_items = [item for item in added_items if item["query"] in verified["confirmed_in_cart"]]
     truly_unavailable = list(set(unavailable_items) | set(verified["missing_from_cart"]))
 
     result = {
         "platform": "flipkart",
-        "added": verified["confirmed_in_cart"],
+        "added": confirmed_items,
         "unavailable": truly_unavailable,
         "cart_url": "https://www.flipkart.com/viewcart",
     }
 
     if truly_unavailable:
         print(f"\n[Flipkart] ⚠️  Items not available: {truly_unavailable}")
-    print(f"[Flipkart] ✅ Shopping run complete. Added: {result['added']}")
+    print(f"[Flipkart] ✅ Shopping run complete. Added {len(result['added'])} items.")
     return result
 
 

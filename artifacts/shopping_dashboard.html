@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agentic Shopping Dashboard</title>
+    
+    <style>
+        :root {
+            --bg-dark: #0f172a;
+            --bg-card: #1e293b;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --accent: #6366f1;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+        }
+        body {
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            margin: 0;
+            padding: 20px;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            padding: 20px;
+            background: linear-gradient(135deg, rgba(99,102,241,0.1), rgba(139,92,246,0.1));
+            border-radius: 16px;
+            border: 1px solid rgba(139,92,246,0.2);
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 2.5rem;
+            background: -webkit-linear-gradient(45deg, #818cf8, #c084fc);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .status-badge {
+            display: inline-block;
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 0.875rem;
+            font-weight: 600;
+            margin-top: 10px;
+            background-color: rgba(16, 185, 129, 0.2);
+            color: var(--success);
+            border: 1px solid rgba(16, 185, 129, 0.5);
+        }
+        .platforms-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 24px;
+        }
+        .platform-col {
+            background: var(--bg-card);
+            border-radius: 16px;
+            padding: 20px;
+            box-shadow: 0 10px 15px -3px rgba(0,0,0,0.5);
+            border: 1px solid rgba(255,255,255,0.05);
+        }
+        .platform-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            padding-bottom: 15px;
+            margin-bottom: 15px;
+        }
+        .platform-header h2 {
+            margin: 0;
+            text-transform: capitalize;
+            font-size: 1.5rem;
+        }
+        .cart-link {
+            color: var(--accent);
+            text-decoration: none;
+            font-size: 0.875rem;
+            padding: 6px 12px;
+            background: rgba(99,102,241,0.1);
+            border-radius: 8px;
+            transition: background 0.2s;
+        }
+        .cart-link:hover {
+            background: rgba(99,102,241,0.2);
+        }
+        .product-card {
+            display: flex;
+            background: rgba(0,0,0,0.2);
+            border-radius: 12px;
+            padding: 12px;
+            margin-bottom: 12px;
+            gap: 15px;
+            transition: transform 0.2s;
+            text-decoration: none;
+            color: inherit;
+        }
+        .product-card:hover {
+            transform: translateY(-2px);
+            background: rgba(0,0,0,0.3);
+        }
+        .product-img {
+            width: 80px;
+            height: 80px;
+            border-radius: 8px;
+            object-fit: cover;
+            background: #2dd4bf20;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .product-img img {
+            width: 100%;
+            height: 100%;
+            border-radius: 8px;
+            object-fit: cover;
+        }
+        .product-info {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+        .product-title {
+            font-size: 0.95rem;
+            font-weight: 500;
+            line-height: 1.4;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+            margin-bottom: 8px;
+        }
+        .product-price {
+            font-size: 1.1rem;
+            font-weight: 700;
+            color: #818cf8;
+        }
+        .query-badge {
+            font-size: 0.7rem;
+            background: rgba(255,255,255,0.1);
+            padding: 2px 6px;
+            border-radius: 4px;
+            align-self: flex-start;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-muted);
+            margin-bottom: 4px;
+        }
+        .unavailable-item {
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px dashed rgba(239, 68, 68, 0.3);
+            border-radius: 12px;
+            padding: 12px;
+            margin-bottom: 12px;
+            color: var(--danger);
+            font-size: 0.9rem;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .empty-state {
+            text-align: center;
+            padding: 30px;
+            color: var(--text-muted);
+            font-style: italic;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🛍️ Agentic Shopping Dashboard</h1>
+        <div class="status-badge">
+            ✅ Shopping Run Complete
+        </div>
+        <p style="color: var(--text-muted); margin-top: 15px;">Requested Items: wireless mouse, AA batteries</p>
+    </div>
+
+    <div class="platforms-container">
+
+        <div class="platform-col">
+            <div class="platform-header">
+                <h2>amazon</h2>
+                <a href="https://www.amazon.in/gp/cart/view.html" target="_blank" class="cart-link">View Cart 🛒</a>
+            </div>
+            
+            <div class="products-list">
+
+                <a href="https://www.amazon.in/Panasonic-EVOLTA-Alkaline-Battery-Pack/dp/B08WBVYBQQ/ref=sr_1_1_sspa?dib=eyJ2IjoiMSJ9.bE8JY4cZTlE7gakf72zsQR1yEqa1EFgClI0IJ45CqmEhu_4fSma-ewjGpYVTOt66YHksRrQKNctfJFJK6T-bqhzqX4nHvT7zQQT7KwAl5_ancshNF3qSrnY_qSMWXnolcfAOsrX5VtqH-4zDvcMhbnHKBrl1Ql-hF_mCtx-V0vOBmd1yxVdx_LpsVUHD7qMlEUx0XKCoTxLtZo9T-QcWESWh0m4DVf09jhxdLrH4pjA.nF9dnWvTIsdIBMXnmEp3_-vnScs-h_SQZsYsD_pheCw&dib_tag=se&keywords=AA%2Bbatteries&qid=1777488786&sr=8-1-spons&aref=kjy3Y162ks&sp_csd=d2lkZ2V0TmFtZT1zcF9hdGY&th=1" target="_blank" class="product-card">
+                    <div class="product-img"><img src="https://m.media-amazon.com/images/I/715ILXPkTHS._SX679_.jpg" alt="Product"></div>
+                    <div class="product-info">
+                        <span class="query-badge">Search: AA batteries</span>
+                        <div class="product-title">Panasonic Evolta AA Alkaline 1.5V Battery, 20 Times Longer Lasting Than Standard zinc Carbon Batteries,Anti-Leak Seal,Protects Power for up to 10 Years-Pack of 8</div>
+                        <div class="product-price">279
+.</div>
+                    </div>
+                </a>
+            
+                <div class="unavailable-item">
+                    <span>❌</span> Not Available / Out of stock: <strong>wireless mouse</strong>
+                </div>
+            
+            </div>
+        </div>
+
+        <div class="platform-col">
+            <div class="platform-header">
+                <h2>flipkart</h2>
+                <a href="https://www.flipkart.com/viewcart" target="_blank" class="cart-link">View Cart 🛒</a>
+            </div>
+            
+            <div class="products-list">
+
+                <a href="https://www.flipkart.com/nippo-3-dg-zinc-carbon-aa-battery/p/itm70b9a32b920da?pid=ACCHYNFDMJ2665DN&lid=LSTACCHYNFDMJ2665DNDQIB7G&marketplace=FLIPKART&q=AA+batteries&store=tyy%2F4mr%2Fw65&srno=s_1_1&otracker=search&iid=en_xYQAY9sXjntiJ9LU5L0_5_bYtfd0c9gV6ZtoCpOkhIGwjR_Hf8_mPS-l2mqHGOzvx8BqkSzCso6QtKpQPxPzzPUFjCTyOHoHZs-Z5_PS_w0%3D&ssid=gksg4jewr40000001777488794935&qH=851a01ac1a5c2223&ov_redirect=true&ov_redirect=true" target="_blank" class="product-card">
+                    <div class="product-img"><img src="https://rukminim2.flixcart.com/image/800/1070/xif0q/battery/7/e/v/-original-imahyvnswzvjtwmg.jpeg?q=90" alt="Product"></div>
+                    <div class="product-info">
+                        <span class="query-badge">Search: AA batteries</span>
+                        <div class="product-title">Nippo 3 DG Zinc Carbon AA  Battery (Pack of 10)</div>
+                        <div class="product-price">₹163</div>
+                    </div>
+                </a>
+            
+                <div class="unavailable-item">
+                    <span>❌</span> Not Available / Out of stock: <strong>wireless mouse</strong>
+                </div>
+            
+            </div>
+        </div>
+
+        <div class="platform-col">
+            <div class="platform-header">
+                <h2>blinkit</h2>
+                <a href="https://blinkit.com/cart" target="_blank" class="cart-link">View Cart 🛒</a>
+            </div>
+            
+            <div class="products-list">
+
+                <a href="https://blinkit.com/s/?q=wireless+mouse" target="_blank" class="product-card">
+                    <div class="product-img"><img src="https://cdn.grofers.com/cdn-cgi/image/f=auto,fit=scale-down,q=70,metadata=none,w=90/da/cms-assets/cms/product/2e0483b0-e2d2-4481-b3a3-9c23709dd83e.png?dpr_multiplier=3.00" alt="Product"></div>
+                    <div class="product-info">
+                        <span class="query-badge">Search: wireless mouse</span>
+                        <div class="product-title">Wireless mouse</div>
+                        <div class="product-price">₹595</div>
+                    </div>
+                </a>
+            
+                <a href="https://blinkit.com/s/?q=AA+batteries" target="_blank" class="product-card">
+                    <div class="product-img"><img src="https://cdn.grofers.com/cdn-cgi/image/f=auto,fit=scale-down,q=70,metadata=none,w=90/da/cms-assets/cms/product/c389b423-f472-43d7-a7c3-ea1266508f03.png?dpr_multiplier=3.00" alt="Product"></div>
+                    <div class="product-info">
+                        <span class="query-badge">Search: AA batteries</span>
+                        <div class="product-title">Aa battery</div>
+                        <div class="product-price">₹65</div>
+                    </div>
+                </a>
+            
+            </div>
+        </div>
+
+    </div>
+</body>
+</html>

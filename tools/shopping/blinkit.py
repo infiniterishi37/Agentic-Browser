@@ -23,6 +23,7 @@ async def shop_on_blinkit(items: list[str], page=None) -> dict:
     page = page or browser_manager.page
     added_items = []
     unavailable_items = []
+    extracted_data = {}
 
     print("[Blinkit] Navigating to blinkit.com...")
     await page.goto("https://blinkit.com", wait_until="domcontentloaded", timeout=30000)
@@ -65,11 +66,78 @@ async def shop_on_blinkit(items: list[str], page=None) -> dict:
             await page.evaluate("window.scrollBy(0, 300)")
             await asyncio.sleep(1.5)
 
+            # ── Extract Product Data ─────────────────────────────────
+            product_url = page.url
+            title = "N/A"
+            price = "N/A"
+            image_url = ""
+            try:
+                extracted = await page.evaluate("""() => {
+                    let title = "N/A";
+                    let price = "N/A";
+                    let img = "";
+                    
+                    // Find the ADD button to locate the first product card
+                    const btns = [...document.querySelectorAll('div[role="button"], button')];
+                    let addBtn = btns.find(el => {
+                        const t = (el.innerText || '').trim();
+                        return t === 'ADD' || t === 'Add' || t.includes('ADD TO CART');
+                    });
+                    
+                    if (addBtn) {
+                        // Traverse up to find the card container
+                        let card = addBtn;
+                        for(let i=0; i<7; i++) {
+                            if(card.parentElement) card = card.parentElement;
+                        }
+                        
+                        // Image
+                        let iNode = card.querySelector('img');
+                        if (iNode) img = iNode.src;
+                        
+                        // Extract text lines
+                        let text = card.innerText || '';
+                        let lines = text.split('\\n').map(l => l.trim()).filter(l => l);
+                        
+                        // Price
+                        for (let line of lines) {
+                            if (line.includes('₹')) {
+                                price = line;
+                                break;
+                            }
+                        }
+                        
+                        // Title (usually the longest string without ₹ and not "ADD" and not "MINS")
+                        for (let line of lines) {
+                            let clean = line.toLowerCase();
+                            if (line.length > 5 && !line.includes('₹') && !clean.includes('min') && !clean.includes('off') && clean !== 'add') {
+                                title = line;
+                                break;
+                            }
+                        }
+                    }
+                    return { title, price, img };
+                }""")
+                
+                title = extracted.get("title", "N/A")
+                price = extracted.get("price", "N/A")
+                image_url = extracted.get("img", "")
+            except Exception as e:
+                print(f"   ⚠️ Could not extract some Blinkit details: {e}")
+
+            extracted_data[item_name] = {
+                "query": item_name,
+                "title": title.strip() if title != "N/A" else item_name,
+                "price": price.strip() if price != "N/A" else "N/A",
+                "image_url": image_url or "",
+                "url": product_url
+            }
+
             # Try clicking the ADD / + button on the first product card
             added = await _click_first_add_button(page)
 
             if added:
-                added_items.append(item_name)
+                added_items.append(extracted_data.get(item_name, {"query": item_name, "title": item_name, "price": "N/A", "image_url": "", "url": page.url}))
                 print(f"   ✅ Added '{item_name}' to Blinkit cart")
             else:
                 unavailable_items.append(item_name)
@@ -87,19 +155,21 @@ async def shop_on_blinkit(items: list[str], page=None) -> dict:
 
     # ── Rechecker ─────────────────────────────────────────────────────────
     print("\n[Blinkit] Running cart rechecker...")
-    verified = await _recheck_blinkit_cart(added_items, page=page)
+    expected_queries = [item["query"] for item in added_items]
+    verified = await _recheck_blinkit_cart(expected_queries, page=page)
+    confirmed_items = [item for item in added_items if item["query"] in verified["confirmed_in_cart"]]
     truly_unavailable = list(set(unavailable_items) | set(verified["missing_from_cart"]))
 
     result = {
         "platform": "blinkit",
-        "added": verified["confirmed_in_cart"],
+        "added": confirmed_items,
         "unavailable": truly_unavailable,
         "cart_url": "https://blinkit.com/cart",
     }
 
     if truly_unavailable:
         print(f"\n[Blinkit] ⚠️  Items not available: {truly_unavailable}")
-    print(f"[Blinkit] ✅ Shopping run complete. Added: {result['added']}")
+    print(f"[Blinkit] ✅ Shopping run complete. Added {len(result['added'])} items.")
     return result
 
 

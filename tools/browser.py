@@ -753,7 +753,7 @@ class BrowserManager:
         if not self.page:
             await self.start()
         try:
-            if not url.startswith('http'):
+            if not url.startswith('http') and not url.startswith('file://'):
                 url = f'https://{url}'
             await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
             return f"Navigated to {url}"

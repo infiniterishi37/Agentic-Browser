@@ -22,6 +22,8 @@ from tools.shopping.flipkart import shop_on_flipkart
 from tools.shopping.blinkit import shop_on_blinkit
 from tools.shopping.google_items import search_items_on_google
 from tools.chat_server import chat_server
+from tools.shopping.dashboard import update_dashboard
+import os
 
 
 CART_URLS = {
@@ -56,7 +58,7 @@ async def run_all_shops(items: list[str]) -> dict:
 
     context = browser_manager.page.context
     pages = {
-        "amazon": browser_manager.page,
+        "amazon": await context.new_page(),
         "flipkart": await context.new_page(),
         "blinkit": await context.new_page(),
     }
@@ -66,25 +68,54 @@ async def run_all_shops(items: list[str]) -> dict:
         "Running all three websites in parallel now. I will aggregate the results once all three finish.",
         "status",
     )
+    
+    # ── Show Initial Loading Dashboard ──
+    dashboard_path = update_dashboard({}, items, is_running=True)
+    dashboard_url = f"file:///{dashboard_path.replace(chr(92), '/')}"
+    await browser_manager.navigate(dashboard_url)
+    # We use return_exceptions=True so one platform failing doesn't crash the whole flow
     amazon_task = shop_on_amazon(items, page=pages["amazon"])
     flipkart_task = shop_on_flipkart(items, page=pages["flipkart"])
     blinkit_task = shop_on_blinkit(items, page=pages["blinkit"])
-    amazon_res, flipkart_res, blinkit_res = await asyncio.gather(
-        amazon_task, flipkart_task, blinkit_task
+    
+    results_raw = await asyncio.gather(
+        amazon_task, flipkart_task, blinkit_task,
+        return_exceptions=True
     )
+    
+    def _safe_res(res, platform_name):
+        if isinstance(res, Exception):
+            print(f"[{platform_name.capitalize()}] ❌ Flow crashed: {res}")
+            return {"platform": platform_name, "added": [], "unavailable": items, "cart_url": "#"}
+        return res
+
+    amazon_res = _safe_res(results_raw[0], "amazon")
+    flipkart_res = _safe_res(results_raw[1], "flipkart")
+    blinkit_res = _safe_res(results_raw[2], "blinkit")
+
     results = {
         "amazon": amazon_res,
         "flipkart": flipkart_res,
         "blinkit": blinkit_res,
     }
 
-    # ── Phase 4: Open all three carts ────────────────────────────────────
-    print("\n[Coordinator] ▶ Phase 2 — Opening all carts")
+    # ── Phase 4: Open Dashboard & Carts ────────────────────────────────────
+    print("\n[Coordinator] ▶ Phase 2 — Generating Dashboard & Opening Carts")
     await chat_server.send_to_browser(
-        "Parallel run is complete. Opening all carts so you can review platform-level outcomes.",
+        "Parallel run is complete. Generating your dashboard and opening carts in the background.",
         "status",
     )
-    await _open_all_carts()
+    
+    # Generate the dashboard HTML
+    dashboard_path = update_dashboard(results, items, is_running=False)
+    dashboard_url = f"file:///{dashboard_path.replace(chr(92), '/')}"
+    
+    # Open carts in background tabs
+    await _open_all_carts(focus_last=False)
+    
+    # Open Dashboard in the active tab
+    print("   Opening Dashboard in current tab...")
+    await browser_manager.navigate(dashboard_url)
 
     # ── Summary Report ───────────────────────────────────────────────────
     _print_summary(results)
@@ -93,28 +124,22 @@ async def run_all_shops(items: list[str]) -> dict:
     return results
 
 
-async def _open_all_carts() -> None:
+async def _open_all_carts(focus_last: bool = True) -> None:
     """
     Opens Amazon, Flipkart, and Blinkit carts each in a dedicated browser tab.
-    The first cart loads in the current tab; subsequent carts open as new tabs.
+    The first cart loads in the current tab (or new tab if focus_last is False); 
+    subsequent carts open as new tabs.
     """
     context = browser_manager.page.context
     cart_platforms = list(CART_URLS.items())
 
-    # Load the first cart in the existing page
-    platform, url = cart_platforms[0]
-    print(f"   Opening {platform} cart in current tab...")
-    await browser_manager.navigate(url)
-    await asyncio.sleep(2)
-
-    # Open remaining carts in new tabs
-    for platform, url in cart_platforms[1:]:
+    for platform, url in cart_platforms:
         print(f"   Opening {platform} cart in new tab...")
         new_page = await context.new_page()
         await new_page.goto(url, wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(1)
 
-    print("[Coordinator] ✅ All three carts are open.")
+    print("[Coordinator] ✅ All three carts are open in background.")
 
 
 def _print_summary(results: dict) -> None:
@@ -201,7 +226,15 @@ def _print_comparison_table(results: dict, all_items: list[str]) -> None:
     # Build lookup: platform → set of added items (lowercase for matching)
     added_sets: dict[str, set] = {}
     for platform, data in results.items():
-        added_sets[platform] = {i.lower() for i in data.get("added", [])}
+        # Handle dicts vs strings
+        added_items = data.get("added", [])
+        extracted_queries = set()
+        for item in added_items:
+            if isinstance(item, dict):
+                extracted_queries.add(item.get("query", "").lower())
+            else:
+                extracted_queries.add(item.lower())
+        added_sets[platform] = extracted_queries
 
     col_w = 14  # item column width
     plat_w = 10  # per-platform column width
