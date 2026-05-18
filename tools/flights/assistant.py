@@ -10,20 +10,26 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from datetime import date
+from datetime import date, timedelta
 from difflib import get_close_matches
-from urllib.parse import urlencode
 
 from tools.browser import browser_manager
 from tools.chat_server import chat_server
 from agent.llm_provider import get_llm
-from tools.flights.ixigo_automation import proceed_with_first_ixigo_option
+from tools.flights.ixigo_automation import (
+    build_ixigo_results_url,
+    open_ixigo_and_search_from_home,
+    proceed_with_first_ixigo_option,
+)
+
+_flight_login_task: asyncio.Task | None = None
 
 
 def _default_state() -> dict:
     return {
         "active": False,
-        "stage": "idle",  # idle | collecting | compared | done
+        "stage": "idle",  # idle | collecting | compared | awaiting_login | provider_ready | done
+        "topic": "execution",  # execution | human
         "origin": "",
         "destination": "",
         "depart_date": "",
@@ -31,7 +37,16 @@ def _default_state() -> dict:
         "trip_type": "oneway",
         "adults": 1,
         "auto_book": False,
+        "book_cheapest": False,
+        "login_prompted": False,
+        "post_login_action": "",
+        "pending_option": {},
         "options": [],
+        "passenger_details": {},
+        "selected_travellers": [],
+        "cancellation_prompted": False,
+        "cancellation_choice": "",  # no | free | flex
+        "cancellation_applied": False,
     }
 
 
@@ -66,7 +81,13 @@ def _norm_date(raw: str) -> str:
     raw = raw.strip()
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
         return raw
+    m = re.fullmatch(r"(\d{2})-(\d{2})-(\d{4})", raw)
+    if m:
+        return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
     m = re.fullmatch(r"(\d{2})/(\d{2})/(\d{4})", raw)
+    if m:
+        return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+    m = re.fullmatch(r"(\d{2})(\d{2})(\d{4})", raw)
     if m:
         return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
     return ""
@@ -106,7 +127,8 @@ MONTHS = {
 
 
 def _norm_place(raw: str) -> str:
-    token = (raw or "").strip().lower()
+    token = re.sub(r"[^a-z ]", " ", (raw or "").strip().lower())
+    token = re.sub(r"\s+", " ", token).strip()
     if re.fullmatch(r"[a-z]{3}", token):
         return token.upper()
     if token in CITY_TO_IATA:
@@ -115,6 +137,31 @@ def _norm_place(raw: str) -> str:
     close = get_close_matches(token, CITY_TO_IATA.keys(), n=1, cutoff=0.78)
     if close:
         return CITY_TO_IATA[close[0]]
+    return ""
+
+
+def _norm_place_phrase(raw: str) -> str:
+    """
+    Normalize place text that may include trailing words like
+    'delhi tomorrow cheapest option' by testing progressively
+    shorter prefixes.
+    """
+    token = re.sub(r"[^a-z ]", " ", (raw or "").strip().lower())
+    token = re.sub(r"\s+", " ", token).strip()
+    if not token:
+        return ""
+
+    direct = _norm_place(token)
+    if direct:
+        return direct
+
+    words = token.split()
+    max_take = min(len(words), 4)
+    for take in range(max_take, 0, -1):
+        probe = " ".join(words[:take])
+        code = _norm_place(probe)
+        if code:
+            return code
     return ""
 
 
@@ -155,9 +202,22 @@ def _parse_human_date(text: str) -> str:
     return ""
 
 
+def _parse_relative_date(text: str) -> str:
+    s = (text or "").strip().lower()
+    today = date.today()
+    if re.search(r"\b(day after tomorrow)\b", s):
+        return (today + timedelta(days=2)).isoformat()
+    if re.search(r"\b(tomorrow|tommorow|tmrw|tmr)\b", s):
+        return (today + timedelta(days=1)).isoformat()
+    if re.search(r"\b(today|todays)\b", s):
+        return today.isoformat()
+    return ""
+
+
 def _extract_fields(text: str) -> dict:
     out: dict[str, str | int] = {}
     s = (text or "").strip()
+    date_token_pat = r"\d{4}-\d{2}-\d{2}|\d{2}[/-]\d{2}[/-]\d{4}|\d{8}"
 
     # Prefer IATA codes for reliability.
     m = re.search(r"\bfrom\s+([A-Za-z]{3})\b", s, flags=re.IGNORECASE)
@@ -166,22 +226,70 @@ def _extract_fields(text: str) -> dict:
     else:
         m = re.search(r"\bfrom\s+([A-Za-z ]{2,40})\s+\bto\b", s, flags=re.IGNORECASE)
         if m:
-            place = _norm_place(m.group(1))
+            place = _norm_place_phrase(m.group(1))
             if place:
                 out["origin"] = place
+    # Natural "Pune to Delhi" style without explicit "from".
+    if not out.get("origin") or not out.get("destination"):
+        m = re.search(r"\b([A-Za-z ]{2,60})\s+\bto\b\s+([A-Za-z ]{2,60})\b", s, flags=re.IGNORECASE)
+        if m:
+            left = re.sub(r"[^a-zA-Z ]", " ", m.group(1)).strip()
+            right = re.sub(r"[^a-zA-Z ]", " ", m.group(2)).strip()
+            left_words = [w for w in left.split() if w]
+            right_words = [w for w in right.split() if w]
+
+            origin_guess = ""
+            destination_guess = ""
+
+            # Try suffixes on left side so "book flight pune" resolves to "pune".
+            for take in range(min(4, len(left_words)), 0, -1):
+                probe = " ".join(left_words[-take:])
+                code = _norm_place_phrase(probe)
+                if code:
+                    origin_guess = code
+                    break
+
+            # Try prefixes on right side so "delhi on 18th may" resolves to "delhi".
+            for take in range(min(4, len(right_words)), 0, -1):
+                probe = " ".join(right_words[:take])
+                code = _norm_place_phrase(probe)
+                if code:
+                    destination_guess = code
+                    break
+
+            if origin_guess and not out.get("origin"):
+                out["origin"] = origin_guess
+            if destination_guess and not out.get("destination"):
+                out["destination"] = destination_guess
     m = re.search(r"\bto\s+([A-Za-z]{3})\b", s, flags=re.IGNORECASE)
     if m:
         out["destination"] = m.group(1).upper()
     else:
         m = re.search(r"\bto\s+([A-Za-z ]{2,40})(?:\s+\bon\b|\s+\bfor\b|$)", s, flags=re.IGNORECASE)
         if m:
-            place = _norm_place(m.group(1))
+            place = _norm_place_phrase(m.group(1))
+            if place:
+                out["destination"] = place
+    if not out.get("destination"):
+        m = re.search(r"\bto\s+([A-Za-z ]{2,60})", s, flags=re.IGNORECASE)
+        if m:
+            place = _norm_place_phrase(m.group(1))
             if place:
                 out["destination"] = place
 
-    m = re.search(r"\b(?:on|depart|departure)\s+(\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4})\b", s, flags=re.IGNORECASE)
+    m = re.search(rf"\b(?:on|depart|departure)\s+({date_token_pat})\b", s, flags=re.IGNORECASE)
     if m:
         d = _norm_date(m.group(1))
+        if d:
+            out["depart_date"] = d
+    if not out.get("depart_date"):
+        m = re.search(rf"\b({date_token_pat})\b", s)
+        if m:
+            d = _norm_date(m.group(1))
+            if d:
+                out["depart_date"] = d
+    if not out.get("depart_date"):
+        d = _parse_relative_date(s)
         if d:
             out["depart_date"] = d
     if not out.get("depart_date"):
@@ -189,7 +297,7 @@ def _extract_fields(text: str) -> dict:
         if d:
             out["depart_date"] = d
 
-    m = re.search(r"\b(?:return|inbound)\s+(\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4})\b", s, flags=re.IGNORECASE)
+    m = re.search(rf"\b(?:return|inbound)\s+({date_token_pat})\b", s, flags=re.IGNORECASE)
     if m:
         d = _norm_date(m.group(1))
         if d:
@@ -215,8 +323,774 @@ def _extract_fields(text: str) -> dict:
 
     if re.search(r"\b(book it for me|book for me|proceed automatically|auto book|without manual)\b", s, flags=re.IGNORECASE):
         out["auto_book"] = True
+    if _wants_cheapest_booking(s):
+        out["book_cheapest"] = True
 
     return out
+
+
+def _wants_cheapest_booking(text: str) -> bool:
+    s = (text or "").lower()
+    return bool(
+        re.search(
+            r"\b(cheapest|lowest fare|minimum fare|least fare)\b", s
+        )
+        and re.search(r"\b(book|flight|ticket|tickets)\b", s)
+    )
+
+
+def _cancel_login_monitor() -> None:
+    global _flight_login_task
+    if _flight_login_task and not _flight_login_task.done():
+        _flight_login_task.cancel()
+    _flight_login_task = None
+
+
+async def _is_login_gate_visible() -> bool:
+    page = browser_manager.page
+    if not page:
+        return False
+    try:
+        return bool(
+            await page.evaluate(
+                """() => {
+                    const isVisible = (el) => {
+                        const cs = window.getComputedStyle(el);
+                        if (!cs || cs.display === 'none' || cs.visibility === 'hidden' || Number(cs.opacity || '1') === 0) return false;
+                        const r = el.getBoundingClientRect();
+                        return !!r && r.width > 8 && r.height > 8;
+                    };
+
+                    const bodyText = (document.body?.innerText || '').toLowerCase();
+                    const hasStrongLoginCopy =
+                        bodyText.includes('log in to continue') ||
+                        bodyText.includes('login to continue') ||
+                        bodyText.includes('sign in to continue') ||
+                        bodyText.includes('continue with phone') ||
+                        bodyText.includes('enter mobile number') ||
+                        bodyText.includes('enter otp') ||
+                        bodyText.includes('verify otp') ||
+                        bodyText.includes('enter password');
+
+                    const pw = Array.from(document.querySelectorAll("input[type='password']")).some(isVisible);
+                    const otp = Array.from(document.querySelectorAll("input[name*='otp' i], input[id*='otp' i], input[autocomplete='one-time-code']")).some(isVisible);
+                    return hasStrongLoginCopy || pw || otp;
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
+async def _attempt_post_login_proceed_click() -> bool:
+    page = browser_manager.page
+    if not page:
+        return False
+    selectors = [
+        "button:has-text('Continue')",
+        "button:has-text('Proceed')",
+        "button:has-text('Next')",
+        "button:has-text('Book')",
+        "button:has-text('Review')",
+        "a:has-text('Continue')",
+        "a:has-text('Proceed')",
+        "[role='button']:has-text('Continue')",
+        "[role='button']:has-text('Proceed')",
+    ]
+    for sel in selectors:
+        try:
+            target = page.locator(sel).first
+            if await target.is_visible(timeout=900):
+                await target.scroll_into_view_if_needed()
+                await target.click(timeout=2200)
+                await asyncio.sleep(1.8)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _enter_human_login_handoff(
+    state: dict,
+    resume_action: str = "resume_continue",
+    pending_option: dict | None = None,
+) -> None:
+    state["stage"] = "awaiting_login"
+    state["topic"] = "human"
+    state["login_prompted"] = True
+    state["post_login_action"] = resume_action
+    state["pending_option"] = pending_option or {}
+    await chat_server.send_to_browser(
+        "Topic switched to human: login is required on this page. Please enter phone number/OTP and complete login.",
+        "status",
+    )
+    await chat_server.send_to_browser(
+        "I will detect successful login automatically and switch back to execution.",
+        "agent",
+    )
+    _start_login_monitor()
+
+
+async def _resume_after_login(state: dict) -> None:
+    state["topic"] = "execution"
+    # After login we should continue provider-side booking flow,
+    # not mark it done, so passenger/cancellation handling stays active.
+    state["stage"] = "provider_ready"
+    await chat_server.send_to_browser(
+        "Topic switched to execution: login detected. Continuing automatically.",
+        "status",
+    )
+
+    action = (state.get("post_login_action") or "resume_continue").strip().lower()
+    pending_option = state.get("pending_option") or {}
+    state["post_login_action"] = ""
+    state["pending_option"] = {}
+
+    if action == "resume_cheapest":
+        result = await _attempt_cheapest_click()
+        await chat_server.send_to_browser(
+            (
+                "Post-login cheapest flow executed."
+                f" Sorted: {'yes' if result.get('sorted') else 'no'}"
+                f", Option clicked: {'yes' if result.get('clicked') else 'no'}."
+                + (" (fallback click used)" if result.get("fallback_rank_click") else "")
+            ),
+            "agent",
+        )
+        if result.get("clicked"):
+            await _handle_provider_page_after_open(state)
+        else:
+            if await _is_login_gate_visible():
+                await _enter_human_login_handoff(state, resume_action="resume_cheapest")
+            else:
+                await chat_server.send_to_browser(
+                    "I could not move ahead automatically after login. Please pick an option on the page and I will continue.",
+                    "agent",
+                )
+                state["stage"] = "compared"
+        return
+
+    if action == "resume_selected":
+        clicked = await _click_option_choice(pending_option)
+        if clicked:
+            await chat_server.send_to_browser("I clicked your selected option after login.", "status")
+            await _handle_provider_page_after_open(state)
+        else:
+            if await _is_login_gate_visible():
+                await _enter_human_login_handoff(
+                    state,
+                    resume_action="resume_selected",
+                    pending_option=pending_option,
+                )
+            else:
+                await chat_server.send_to_browser(
+                    "I could not click the selected option after login. Please click it once and share the opened URL.",
+                    "agent",
+                )
+        return
+
+    advanced = await _attempt_post_login_proceed_click()
+    if advanced:
+        await chat_server.send_to_browser(
+            "I moved ahead after login. Share passenger details now and I will continue booking.",
+            "agent",
+        )
+    else:
+        await chat_server.send_to_browser(
+            "Login is complete. Share passenger details on this page and I will continue booking.",
+            "agent",
+        )
+
+
+async def _handle_provider_page_after_open(state: dict) -> None:
+    await asyncio.sleep(1.5)
+    if await _is_login_gate_visible():
+        await _enter_human_login_handoff(state, resume_action="resume_continue")
+        return
+
+    state["topic"] = "execution"
+    state["stage"] = "provider_ready"
+    advanced = await _attempt_post_login_proceed_click()
+    if advanced:
+        await chat_server.send_to_browser(
+            "I clicked Continue on the provider page. Share passenger details and I will fill them.",
+            "status",
+        )
+        return
+    await chat_server.send_to_browser(
+        "Provider page is open and ready. Share passenger details in chat and I will continue booking.",
+        "agent",
+    )
+
+
+def _extract_passenger_details(text: str) -> dict:
+    out: dict[str, str] = {}
+    s = (text or "").strip()
+    if not s:
+        return out
+    m = re.search(r"\b(?:name\s*(?:is|:)\s*)?([A-Za-z]+(?:\s+[A-Za-z]+){1,3})\b", s, flags=re.IGNORECASE)
+    if m:
+        candidate = m.group(1).strip()
+        if len(candidate.split()) >= 2:
+            out["full_name"] = " ".join(w.capitalize() for w in candidate.split())
+    m = re.search(r"\b([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})\b", s)
+    if m:
+        out["email"] = m.group(1).strip()
+    m = re.search(r"\b(?:\+?91[\s-]?)?([6-9]\d{9})\b", s)
+    if m:
+        out["phone"] = m.group(1).strip()
+    if re.search(r"\b(male|man)\b", s, flags=re.IGNORECASE):
+        out["gender"] = "male"
+    elif re.search(r"\b(female|woman)\b", s, flags=re.IGNORECASE):
+        out["gender"] = "female"
+    return out
+
+
+def _extract_traveller_names(text: str) -> list[str]:
+    s = (text or "").strip()
+    if not s:
+        return []
+    cleaned = re.sub(r"\b(mr|mrs|ms|miss|dr)\.?\s+", "", s, flags=re.IGNORECASE)
+    pattern = r"([A-Za-z]+(?:\s+[A-Za-z]+){1,3})"
+    names = []
+    for m in re.finditer(pattern, cleaned):
+        candidate = " ".join(x.capitalize() for x in m.group(1).split())
+        candidate = re.sub(
+            r"^(select|choose|pick|add|include|passenger|traveller|traveler)\s+",
+            "",
+            candidate,
+            flags=re.IGNORECASE,
+        ).strip()
+        low = candidate.lower()
+        if any(k in low for k in ["passenger", "traveller", "adult", "child", "male", "female", "email", "phone"]):
+            continue
+        if len(candidate.split()) >= 2:
+            names.append(candidate)
+    # preserve order, unique
+    seen = set()
+    out = []
+    for n in names:
+        key = n.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(n)
+    return out
+
+
+def _looks_like_passenger_input(text: str) -> bool:
+    s = (text or "").lower()
+    signals = [
+        "name",
+        "email",
+        "phone",
+        "mobile",
+        "passenger",
+        "traveller",
+        "male",
+        "female",
+        "@",
+    ]
+    if any(k in s for k in signals):
+        return True
+    return bool(re.search(r"\b[6-9]\d{9}\b", s))
+
+
+async def _fill_passenger_details_on_page(details: dict, auto_continue: bool = False) -> dict:
+    page = browser_manager.page
+    if not page:
+        return {"filled": False, "selected": False, "continue_clicked": False}
+    try:
+        result = await page.evaluate(
+            """({ details, autoContinue }) => {
+                const isVisible = (el) => {
+                    const cs = window.getComputedStyle(el);
+                    if (!cs || cs.display === 'none' || cs.visibility === 'hidden' || Number(cs.opacity || '1') === 0) return false;
+                    const r = el.getBoundingClientRect();
+                    return !!r && r.width > 8 && r.height > 8;
+                };
+                const clean = (x) => String(x || '').trim();
+                const findInput = (patterns) => {
+                    const inputs = Array.from(document.querySelectorAll("input, textarea")).filter(isVisible);
+                    for (const el of inputs) {
+                        if (el.closest('#agentic-chat-root')) continue;
+                        const hay = [
+                            el.getAttribute('name') || '',
+                            el.getAttribute('id') || '',
+                            el.getAttribute('placeholder') || '',
+                            el.getAttribute('aria-label') || '',
+                            el.labels && el.labels[0] ? (el.labels[0].innerText || '') : '',
+                        ].join(' ').toLowerCase();
+                        if (patterns.some((p) => hay.includes(p))) return el;
+                    }
+                    return null;
+                };
+                const setVal = (el, value) => {
+                    if (!el || !value) return false;
+                    el.focus();
+                    el.value = '';
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.value = value;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    return true;
+                };
+                const norm = (v) => String(v || '').toLowerCase().replace(/[^a-z]/g, ' ').replace(/\\s+/g, ' ').trim();
+                const maybeToggleCheckbox = (name) => {
+                    const target = norm(name);
+                    if (!target) return false;
+                    const labels = Array.from(document.querySelectorAll('label, div, span, p, li')).filter(isVisible);
+                    for (const node of labels) {
+                        if (node.closest('#agentic-chat-root')) continue;
+                        const txt = norm(node.innerText || node.textContent || '');
+                        if (!txt || !txt.includes(target)) continue;
+                        const box = node.querySelector("input[type='checkbox']") || node.closest('label')?.querySelector("input[type='checkbox']");
+                        if (box && !box.checked) {
+                            try { box.click(); return true; } catch (e) {}
+                        }
+                        const nearby = node.parentElement ? node.parentElement.querySelector("input[type='checkbox']") : null;
+                        if (nearby && !nearby.checked) {
+                            try { nearby.click(); return true; } catch (e) {}
+                        }
+                        const clickable = node.closest("label, [role='checkbox'], [role='button'], div");
+                        if (clickable) {
+                            try { clickable.click(); return true; } catch (e) {}
+                        }
+                    }
+                    return false;
+                };
+
+                let filledAny = false;
+                let selectedAny = false;
+                const selectedTravellers = Array.isArray(details.selected_travellers) ? details.selected_travellers : [];
+                for (const t of selectedTravellers) {
+                    selectedAny = maybeToggleCheckbox(t) || selectedAny;
+                }
+                const fullName = clean(details.full_name);
+                if (fullName) {
+                    const parts = fullName.split(/\\s+/);
+                    const first = parts[0] || '';
+                    const last = parts.slice(1).join(' ') || '';
+                    const firstInput = findInput(['first', 'fname', 'given']);
+                    const lastInput = findInput(['last', 'lname', 'surname', 'family']);
+                    const fullNameInput = findInput(['full name', 'passenger name', 'traveller name']);
+                    if (firstInput || lastInput) {
+                        filledAny = setVal(firstInput, first) || filledAny;
+                        filledAny = setVal(lastInput, last || first) || filledAny;
+                    } else if (fullNameInput) {
+                        filledAny = setVal(fullNameInput, fullName) || filledAny;
+                    }
+                }
+                if (clean(details.email)) {
+                    filledAny = setVal(findInput(['email', 'e-mail']), clean(details.email)) || filledAny;
+                }
+                if (clean(details.phone)) {
+                    filledAny = setVal(findInput(['phone', 'mobile', 'contact']), clean(details.phone)) || filledAny;
+                }
+                if (clean(details.gender)) {
+                    const label = details.gender.toLowerCase() === 'female' ? 'female' : 'male';
+                    const candidates = Array.from(document.querySelectorAll("button, label, [role='button'], [role='radio'], input[type='radio']"))
+                        .filter(isVisible)
+                        .filter((el) => (el.innerText || el.textContent || el.getAttribute('value') || '').toLowerCase().includes(label));
+                    if (candidates.length > 0) {
+                        const t = candidates[0];
+                        try { t.click(); filledAny = true; } catch (e) {}
+                    }
+                }
+
+                let continueClicked = false;
+                if (autoContinue) {
+                    const continueTexts = ['continue', 'proceed', 'next', 'review', 'payment'];
+                    const actions = Array.from(document.querySelectorAll("button, a, [role='button']")).filter(isVisible);
+                    for (const el of actions) {
+                        if (el.closest('#agentic-chat-root')) continue;
+                        const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
+                        if (!txt) continue;
+                        if (txt.includes('lock price')) continue;
+                        if (!continueTexts.some((k) => txt.includes(k))) continue;
+                        try {
+                            el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+                            el.click();
+                            continueClicked = true;
+                            break;
+                        } catch (e) {}
+                    }
+                }
+                return { filled: filledAny, selected: selectedAny, continue_clicked: continueClicked };
+            }""",
+            {"details": details, "autoContinue": bool(auto_continue)},
+        )
+        return result or {"filled": False, "selected": False, "continue_clicked": False}
+    except Exception:
+        return {"filled": False, "selected": False, "continue_clicked": False}
+
+
+def _extract_cancellation_choice(text: str) -> str:
+    s = (text or "").strip().lower()
+    if not s:
+        return ""
+    if re.search(r"\b(1|free cancellation)\b", s):
+        return "free"
+    if re.search(r"\b(2|resched|flex)\b", s):
+        return "flex"
+    if re.search(r"\b(3|no|don't want|do not want|skip|without cancellation)\b", s):
+        return "no"
+    return ""
+
+
+async def _select_cancellation_on_page(choice: str) -> bool:
+    page = browser_manager.page
+    if not page:
+        return False
+    target = (choice or "no").strip().lower()
+    if target not in {"free", "flex", "no"}:
+        target = "no"
+    try:
+        # Deterministic ixigo selectors from provider DOM:
+        # free -> id="Free Cancellation-radio" (value=0)
+        # flex -> id="Free Cancellation + Rescheduling-radio" (value=1)
+        # no   -> id="standalone-none-fareType" (value=2)
+        direct = await page.evaluate(
+            """(target) => {
+                const idByTarget = {
+                    free: 'Free Cancellation-radio',
+                    flex: 'Free Cancellation + Rescheduling-radio',
+                    no: 'standalone-none-fareType',
+                };
+                const expectedValue = { free: '0', flex: '1', no: '2' };
+                const groupName = 'fare-type-selection';
+                const id = idByTarget[target] || idByTarget.no;
+                const input = document.getElementById(id);
+                if (!input) return { ok: false, reason: 'id_not_found' };
+
+                const fire = (el, type) => {
+                    try {
+                        el.dispatchEvent(new Event(type, { bubbles: true }));
+                    } catch (e) {}
+                };
+                const fireMouse = (el, type) => {
+                    try {
+                        el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+                    } catch (e) {}
+                };
+
+                const wrapper = input.closest('span, label, section, div') || input;
+                try { wrapper.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (e) {}
+
+                // Click path first for framework handlers.
+                try { input.click(); } catch (e) {}
+                fireMouse(input, 'mousedown');
+                fireMouse(input, 'mouseup');
+                fireMouse(input, 'click');
+                fire(input, 'input');
+                fire(input, 'change');
+
+                // Force checked as last resort and re-emit events.
+                if (!input.checked) {
+                    try { input.checked = true; } catch (e) {}
+                    fire(input, 'input');
+                    fire(input, 'change');
+                }
+
+                const group = Array.from(document.querySelectorAll("input[type='radio'][name='" + groupName + "']"));
+                const checked = group.find((el) => el.checked);
+                const ok = !!(checked && String(checked.value) === expectedValue[target]);
+                return {
+                    ok,
+                    checked_value: checked ? String(checked.value) : '',
+                    target_value: expectedValue[target],
+                };
+            }""",
+            target,
+        )
+        if direct and direct.get("ok"):
+            return True
+
+        status = await page.evaluate(
+            """async (target) => {
+                const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+                const isVisible = (el) => {
+                    const cs = window.getComputedStyle(el);
+                    if (!cs || cs.display === 'none' || cs.visibility === 'hidden' || Number(cs.opacity || '1') === 0) return false;
+                    const r = el.getBoundingClientRect();
+                    return !!r && r.width > 8 && r.height > 8;
+                };
+                const norm = (v) => String(v || '')
+                    .toLowerCase()
+                    .replace(/[’']/g, "'")
+                    .replace(/\\s+/g, ' ')
+                    .trim();
+                const hasWord = (txt, phrase) => norm(txt).includes(norm(phrase));
+                const hasAssuredFeeInSummary = () => {
+                    const panels = Array.from(document.querySelectorAll('div, section, article')).filter(isVisible);
+                    for (const p of panels) {
+                        const txt = norm(p.innerText || p.textContent || '');
+                        if (!txt.includes('fare summary')) continue;
+                        if (txt.includes('assured fee')) return true;
+                    }
+                    return false;
+                };
+                const hasClassState = (el) => {
+                    let cur = el;
+                    for (let i = 0; i < 4 && cur; i++) {
+                        const cls = (cur.className || '').toString().toLowerCase();
+                        if (cls.includes('selected') || cls.includes('checked') || cls.includes('active')) return true;
+                        if ((cur.getAttribute?.('aria-checked') || '').toLowerCase() === 'true') return true;
+                        cur = cur.parentElement;
+                    }
+                    return false;
+                };
+                const isSelectedNode = (node) => {
+                    const checkedInput = node.querySelector("input[type='radio']:checked, input[type='checkbox']:checked");
+                    if (checkedInput) return true;
+                    const ariaChecked = node.querySelector("[role='radio'][aria-checked='true'], [role='checkbox'][aria-checked='true']");
+                    if (ariaChecked) return true;
+                    return hasClassState(node);
+                };
+
+                const allContainers = Array.from(document.querySelectorAll('section, article, div')).filter(isVisible);
+                const sectionCandidates = allContainers
+                    .filter((el) => {
+                        const txt = norm(el.innerText || el.textContent || '');
+                        return txt.includes('add free cancellation to your trip') && txt.includes('free cancellation');
+                    })
+                    .sort((a, b) => (a.innerText || '').length - (b.innerText || '').length);
+                const section = sectionCandidates[0] || document.body;
+                const scopedNodes = Array.from(section.querySelectorAll('label, div, article, section, li, p, span, button'))
+                    .filter(isVisible)
+                    .filter((el) => !el.closest('#agentic-chat-root'));
+
+                const rowFor = (kind) => {
+                    let found = [];
+                    for (const el of scopedNodes) {
+                        const txt = norm(el.innerText || el.textContent || '');
+                        if (!txt) continue;
+                        if (kind === 'no') {
+                            if (
+                                txt.includes("i don't want free cancellation")
+                                || txt.includes('do not want free cancellation')
+                                || txt.includes('dont want free cancellation')
+                            ) found.push(el);
+                        } else if (kind === 'flex') {
+                            if (txt.includes('free cancellation + rescheduling') || txt.includes('rescheduling')) found.push(el);
+                        } else if (kind === 'free') {
+                            if (txt.includes('free cancellation') && !txt.includes('rescheduling') && !txt.includes("don't want")) found.push(el);
+                        }
+                    }
+                    found = found
+                        .filter((el) => norm(el.innerText || '').length < 280)
+                        .sort((a, b) => (a.innerText || '').length - (b.innerText || '').length);
+                    return found[0] || null;
+                };
+                const findClickableRowAncestor = (node, phrase) => {
+                    let cur = node;
+                    for (let i = 0; i < 8 && cur; i++) {
+                        const txt = norm(cur.innerText || cur.textContent || '');
+                        const r = cur.getBoundingClientRect();
+                        if (
+                            txt.includes(phrase) &&
+                            r.width > 250 &&
+                            r.height >= 24
+                        ) {
+                            return cur;
+                        }
+                        cur = cur.parentElement;
+                    }
+                    return node;
+                };
+
+                const clickTarget = async (node) => {
+                    if (!node) return false;
+                    const clickables = [
+                        ...node.querySelectorAll("input[type='radio'], input[type='checkbox']"),
+                        ...node.querySelectorAll("[role='radio'], [role='checkbox'], button"),
+                    ];
+                    if (node.closest('label')) clickables.unshift(node.closest('label'));
+                    clickables.push(node);
+                    const uniq = [];
+                    const seen = new Set();
+                    for (const c of clickables) {
+                        if (!c || seen.has(c)) continue;
+                        seen.add(c);
+                        uniq.push(c);
+                    }
+                    for (const c of uniq) {
+                        try {
+                            c.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+                            c.click();
+                            await sleep(70);
+                            if (isSelectedNode(node)) return true;
+                        } catch (e) {}
+                    }
+                    return isSelectedNode(node);
+                };
+
+                const rowCandidate = rowFor(target);
+                const noPhrase = "i don't want free cancellation";
+                const row = rowCandidate
+                    ? findClickableRowAncestor(rowCandidate, target === 'no' ? noPhrase : norm(rowCandidate.innerText || ''))
+                    : null;
+                if (!row) return { section_found: section !== document.body, row_found: false, selected: false };
+                if (isSelectedNode(row)) return { section_found: true, row_found: true, selected: true };
+                const clicked = await clickTarget(row);
+                if (clicked) return { section_found: true, row_found: true, selected: true };
+
+                // Fallback: click near left side of the row where radio indicator usually sits.
+                try {
+                    const r = row.getBoundingClientRect();
+                    const y = Math.round(r.top + Math.min(r.height / 2, 24));
+                    const xs = [
+                        Math.max(6, Math.round(r.left - 36)),
+                        Math.max(6, Math.round(r.left - 24)),
+                        Math.max(6, Math.round(r.left - 12)),
+                        Math.max(6, Math.round(r.left + 8)),
+                        Math.max(6, Math.round(r.left + 18)),
+                    ];
+                    for (const x of xs) {
+                        const hit = document.elementFromPoint(x, y);
+                        if (!hit || !isVisible(hit)) continue;
+                        hit.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                        hit.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                        hit.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                        await sleep(90);
+                        if (isSelectedNode(row)) break;
+                    }
+                } catch (e) {}
+                const selectedNow = isSelectedNode(row);
+                if (!selectedNow && target === 'no' && !hasAssuredFeeInSummary()) {
+                    return { section_found: true, row_found: true, selected: true };
+                }
+                return { section_found: true, row_found: true, selected: selectedNow };
+            }""",
+            target,
+        )
+        return bool(status and status.get("selected"))
+    except Exception:
+        return False
+
+
+async def _apply_cancellation_choice(state: dict, choice: str, announce: bool = False) -> bool:
+    target = (choice or "no").strip().lower()
+    if target not in {"free", "flex", "no"}:
+        target = "no"
+
+    for _ in range(3):
+        ok = await _select_cancellation_on_page(target)
+        if ok:
+            state["cancellation_choice"] = target
+            state["cancellation_applied"] = True
+            if announce:
+                label = {
+                    "free": "Free Cancellation",
+                    "flex": "Free Cancellation + Rescheduling",
+                    "no": "I don't want Free Cancellation",
+                }.get(target, "I don't want Free Cancellation")
+                await chat_server.send_to_browser(f"Selected cancellation option: {label}.", "status")
+            return True
+        await asyncio.sleep(0.35)
+    state["cancellation_choice"] = target
+    state["cancellation_applied"] = False
+    return False
+
+
+async def _click_booking_continue_on_page() -> bool:
+    page = browser_manager.page
+    if not page:
+        return False
+    selectors = [
+        "button:text-is('Continue')",
+        "[role='button']:text-is('Continue')",
+        "a:text-is('Continue')",
+        "button:has-text('Continue')",
+        "[role='button']:has-text('Continue')",
+    ]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            count = await loc.count()
+            if count < 1:
+                continue
+            for i in range(min(count, 8)):
+                cand = loc.nth(i)
+                if not await cand.is_visible(timeout=500):
+                    continue
+                in_chat = await cand.evaluate(
+                    """(el) => !!el.closest('#agentic-chat-root')"""
+                )
+                if in_chat:
+                    continue
+                txt = (await cand.inner_text(timeout=500)).strip().lower()
+                if "lock price" in txt:
+                    continue
+                await cand.scroll_into_view_if_needed()
+                await cand.click(timeout=1800)
+                await asyncio.sleep(1.0)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _ensure_cancellation_prompt(state: dict) -> None:
+    if state.get("cancellation_prompted"):
+        return
+    state["cancellation_prompted"] = True
+    await chat_server.send_to_browser(
+        (
+            "Cancellation add-on checklist:\n"
+            "1. Free Cancellation\n"
+            "2. Free Cancellation + Rescheduling\n"
+            "3. I don't want Free Cancellation (default)\n"
+            "Default is being applied automatically now. Reply only if you want to override with 1 or 2."
+        ),
+        "agent",
+    )
+    selected = await _apply_cancellation_choice(state, "no", announce=False)
+    if selected:
+        await chat_server.send_to_browser(
+            "Default applied: option 3 selected (I don't want Free Cancellation).",
+            "status",
+        )
+    else:
+        await chat_server.send_to_browser(
+            "I could not confirm cancellation default click yet. I will retry before final continue.",
+            "status",
+        )
+
+
+def _start_login_monitor() -> None:
+    global _flight_login_task
+    _cancel_login_monitor()
+    _flight_login_task = asyncio.create_task(_wait_for_login_and_proceed())
+
+
+async def _wait_for_login_and_proceed() -> None:
+    try:
+        for _ in range(300):  # ~10 minutes
+            await asyncio.sleep(2)
+            state = chat_server.flight_booking_state or {}
+            if not state.get("active"):
+                return
+            if state.get("stage") != "awaiting_login":
+                return
+            if await _is_login_gate_visible():
+                continue
+
+            await _resume_after_login(state)
+            return
+
+        await chat_server.send_to_browser(
+            "Still waiting for login completion. Once you log in, I will continue automatically.",
+            "status",
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # Keep flow resilient even if polling fails.
+        pass
+    finally:
+        global _flight_login_task
+        _flight_login_task = None
 
 
 async def _llm_extract_fields(text: str) -> dict:
@@ -281,26 +1155,6 @@ def _missing_fields(state: dict) -> list[str]:
     return missing
 
 
-def _build_ixigo_url(state: dict) -> str:
-    origin = state["origin"].upper()
-    destination = state["destination"].upper()
-    depart = state["depart_date"]
-    base = "https://www.ixigo.com/search/result/flight"
-    query = {
-        "from": origin,
-        "to": destination,
-        "date": depart,
-        "adults": state.get("adults", 1),
-        "children": 0,
-        "infants": 0,
-        "class": "e",
-        "source": "Search Form",
-    }
-    if state.get("trip_type") == "return" and state.get("return_date"):
-        query["returnDate"] = state["return_date"]
-    return f"{base}?{urlencode(query)}"
-
-
 async def _extract_booking_options() -> list[dict]:
     await asyncio.sleep(5)
     page = browser_manager.page
@@ -327,6 +1181,235 @@ async def _extract_booking_options() -> list[dict]:
     return options or []
 
 
+async def _extract_clickable_ixigo_options() -> list[dict]:
+    """
+    Extract visible clickable flight actions from Ixigo results page.
+    Options are rank-based so user choices can be re-resolved against
+    the latest DOM at click time.
+    """
+    await asyncio.sleep(1.5)
+    page = browser_manager.page
+    if not page:
+        return []
+    try:
+        options = await page.evaluate(
+            """() => {
+                const isVisible = (el) => {
+                    const cs = window.getComputedStyle(el);
+                    if (!cs || cs.display === 'none' || cs.visibility === 'hidden' || Number(cs.opacity || '1') === 0) return false;
+                    const r = el.getBoundingClientRect();
+                    if (!r || r.width < 8 || r.height < 8) return false;
+                    if (r.bottom < 0 || r.top > window.innerHeight) return false;
+                    if (r.right < 0 || r.left > window.innerWidth) return false;
+                    return true;
+                };
+
+                const getActionType = (el) => {
+                    const txt = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    if (!txt) return '';
+                    if (txt.includes('lock price')) return '';
+                    if (txt === 'book' || txt.startsWith('book ')) return 'book';
+                    if (txt === 'select' || txt.startsWith('select ')) return 'select';
+                    if (txt.includes('view deal')) return 'deal';
+                    return '';
+                };
+
+                const isAction = (el) => {
+                    const actionType = getActionType(el);
+                    if (!actionType) return false;
+                    const tag = (el.tagName || '').toLowerCase();
+                    const role = (el.getAttribute('role') || '').toLowerCase();
+                    const enabled = !el.hasAttribute('disabled') && (el.getAttribute('aria-disabled') || '').toLowerCase() !== 'true';
+                    if (!enabled) return false;
+                    if (el.closest('#agentic-chat-root')) return false;
+                    return tag === 'button' || tag === 'a' || role === 'button';
+                };
+
+                const cardLabel = (el) => {
+                    const card = el.closest('article, li, [class*="flight"], [class*="result"], [data-testid*="flight"], [class*="item"]');
+                    const raw = (card?.innerText || el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                    const cleaned = raw
+                        .replace(/\\b(book|select|view deal|details)\\b/ig, ' ')
+                        .replace(/\\s+/g, ' ')
+                        .trim();
+                    return cleaned.slice(0, 140);
+                };
+
+                const nodes = Array.from(document.querySelectorAll("button, a, [role='button']"));
+                const candidates = [];
+                const seen = new Set();
+                for (const el of nodes) {
+                    if (!isAction(el) || !isVisible(el)) continue;
+                    const r = el.getBoundingClientRect();
+                    const actionType = getActionType(el);
+                    const key = `${Math.round(r.left)}:${Math.round(r.top)}:${Math.round(r.width)}:${Math.round(r.height)}:${(el.innerText || '').replace(/\\s+/g, ' ').trim().toLowerCase()}`;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    candidates.push({
+                        el,
+                        actionType,
+                        top: r.top,
+                        left: r.left,
+                    });
+                }
+
+                const actionPriority = (t) => (t === 'book' ? 0 : t === 'select' ? 1 : 2);
+                candidates.sort((a, b) =>
+                    (actionPriority(a.actionType) - actionPriority(b.actionType)) ||
+                    (a.top - b.top) ||
+                    (a.left - b.left)
+                );
+                const out = [];
+                for (let i = 0; i < candidates.length && out.length < 8; i++) {
+                    const el = candidates[i].el;
+                    const label = cardLabel(el) || `Option ${out.length + 1}`;
+                    out.push({
+                        label,
+                        rank: out.length,
+                        kind: 'ixigo_click',
+                    });
+                }
+                return out;
+            }"""
+        )
+        return options or []
+    except Exception:
+        return []
+
+
+async def _count_clickable_ixigo_options(limit: int = 8) -> int:
+    options = await _extract_clickable_ixigo_options()
+    if not options:
+        return 0
+    return min(len(options), max(1, int(limit)))
+
+
+async def _click_option_choice(selected: dict) -> bool:
+    """
+    Execute a selected option from state.
+    """
+    page = browser_manager.page
+    if not page:
+        return False
+
+    if selected.get("kind") == "external_url" and selected.get("url"):
+        await browser_manager.navigate(selected["url"])
+        return True
+
+    # Resolve click by current on-screen rank to avoid stale DOM ids/indexes.
+    rank = selected.get("rank")
+    if isinstance(rank, int) and rank >= 0:
+        clicked = await _click_ixigo_option_by_rank(rank)
+        if clicked:
+            return True
+        # One refresh retry for late Ixigo rerenders.
+        await asyncio.sleep(1.2)
+        return await _click_ixigo_option_by_rank(rank)
+
+    return False
+
+
+async def _click_ixigo_option_by_rank(rank: int) -> bool:
+    page = browser_manager.page
+    if not page:
+        return False
+    try:
+        result = await page.evaluate(
+            """(targetRank) => {
+                const isVisible = (el) => {
+                    const cs = window.getComputedStyle(el);
+                    if (!cs || cs.display === 'none' || cs.visibility === 'hidden' || Number(cs.opacity || '1') === 0) return false;
+                    const r = el.getBoundingClientRect();
+                    if (!r || r.width < 8 || r.height < 8) return false;
+                    if (r.bottom < 0 || r.top > window.innerHeight) return false;
+                    if (r.right < 0 || r.left > window.innerWidth) return false;
+                    return true;
+                };
+                const getActionType = (el) => {
+                    const txt = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    if (!txt) return '';
+                    if (txt.includes('lock price')) return '';
+                    if (txt === 'book' || txt.startsWith('book ')) return 'book';
+                    if (txt === 'select' || txt.startsWith('select ')) return 'select';
+                    if (txt.includes('view deal')) return 'deal';
+                    return '';
+                };
+                const isAction = (el) => {
+                    const actionType = getActionType(el);
+                    if (!actionType) return false;
+                    if (el.closest('#agentic-chat-root')) return false;
+                    if (el.hasAttribute('disabled')) return false;
+                    if ((el.getAttribute('aria-disabled') || '').toLowerCase() === 'true') return false;
+                    const tag = (el.tagName || '').toLowerCase();
+                    const role = (el.getAttribute('role') || '').toLowerCase();
+                    return tag === 'button' || tag === 'a' || role === 'button';
+                };
+
+                const nodes = Array.from(document.querySelectorAll("button, a, [role='button']"))
+                    .filter((el) => isAction(el) && isVisible(el))
+                    .map((el) => ({ el, rect: el.getBoundingClientRect(), actionType: getActionType(el) }));
+
+                const dedup = [];
+                const seen = new Set();
+                for (const n of nodes) {
+                    const txt = (n.el.innerText || n.el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const key = `${Math.round(n.rect.left)}:${Math.round(n.rect.top)}:${Math.round(n.rect.width)}:${Math.round(n.rect.height)}:${txt}`;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    dedup.push(n);
+                }
+
+                const actionPriority = (t) => (t === 'book' ? 0 : t === 'select' ? 1 : 2);
+                dedup.sort((a, b) =>
+                    (actionPriority(a.actionType) - actionPriority(b.actionType)) ||
+                    (a.rect.top - b.rect.top) ||
+                    (a.rect.left - b.rect.left)
+                );
+                if (targetRank < 0 || targetRank >= dedup.length) return { ok: false, reason: 'out_of_range', count: dedup.length };
+
+                const target = dedup[targetRank].el;
+                target.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+                try {
+                    target.click();
+                    return { ok: true, count: dedup.length };
+                } catch (e) {
+                    try {
+                        target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                        target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                        target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                        return { ok: true, count: dedup.length };
+                    } catch (e2) {
+                        return { ok: false, reason: 'click_failed', count: dedup.length };
+                    }
+                }
+            }""",
+            rank,
+        )
+        if result and result.get("ok"):
+            await asyncio.sleep(2.0)
+            return True
+    except Exception:
+        return False
+    return False
+
+
+async def _attempt_cheapest_click() -> dict:
+    """
+    Try cheapest auto-flow first, then fallback to first ranked visible Book action.
+    """
+    result = await proceed_with_first_ixigo_option()
+    if result.get("clicked"):
+        result["fallback_rank_click"] = False
+        return result
+
+    # Fallback for pages where cheapest card CTA exists but initial click misses.
+    fallback_clicked = await _click_ixigo_option_by_rank(0)
+    result["fallback_rank_click"] = bool(fallback_clicked)
+    if fallback_clicked:
+        result["clicked"] = True
+    return result
+
+
 async def _open_first_available_flight_offer() -> None:
     """
     Try to open a flight offer card so provider links become visible.
@@ -335,9 +1418,11 @@ async def _open_first_available_flight_offer() -> None:
     if not page:
         return
     selectors = [
+        "button:has-text('Book')",
         "button:has-text('Select')",
         "button:has-text('View deal')",
-        "button:has-text('Book')",
+        "[role='button']:has-text('Book')",
+        "a:has-text('Book')",
         "[role='button']:has-text('Select')",
         "a:has-text('Select')",
     ]
@@ -359,13 +1444,24 @@ def _merge_state(state: dict, update: dict) -> dict:
 
 
 def _parse_choice(text: str, max_n: int) -> int:
-    m = re.search(r"\b(?:option|pick|choose|go with)\s*(\d+)\b", text, flags=re.IGNORECASE)
-    if not m:
+    idx = _extract_choice_number(text)
+    if idx <= 0:
         return 0
-    idx = int(m.group(1))
     if 1 <= idx <= max_n:
         return idx
     return 0
+
+
+def _extract_choice_number(text: str) -> int:
+    m = re.search(r"\b(?:option|pick|choose|go with)\s*(\d+)\b", text, flags=re.IGNORECASE)
+    if not m:
+        m = re.search(r"\b(\d+)\b", text, flags=re.IGNORECASE)
+    if not m:
+        return 0
+    try:
+        return int(m.group(1))
+    except Exception:
+        return 0
 
 
 def _is_new_flight_request(text: str) -> bool:
@@ -383,6 +1479,7 @@ async def handle_flight_chat_message(message: str) -> bool:
 
     # Exit command
     if state.get("active") and text.lower() in {"cancel flight", "cancel booking", "stop flight flow"}:
+        _cancel_login_monitor()
         chat_server.flight_booking_state = _default_state()
         await chat_server.send_to_browser("Flight booking flow cancelled.", "system")
         return True
@@ -393,15 +1490,132 @@ async def handle_flight_chat_message(message: str) -> bool:
 
     # Reset stale flow on a clearly new flight request.
     if state.get("active") and _is_new_flight_request(text):
+        _cancel_login_monitor()
         state = _default_state()
         chat_server.flight_booking_state = state
+
+    if state.get("stage") == "awaiting_login":
+        if text.lower() in {"logged in", "i logged in", "done", "continue"}:
+            if await _is_login_gate_visible():
+                await chat_server.send_to_browser(
+                    "I still see the login step on page. Please complete login and I will proceed automatically.",
+                    "agent",
+                )
+            else:
+                _cancel_login_monitor()
+                await _resume_after_login(state)
+            return True
+        await chat_server.send_to_browser(
+            "Please complete login on the opened page. I will auto-detect and continue.",
+            "agent",
+        )
+        return True
+
+    if state.get("stage") == "done":
+        if _is_new_flight_request(text):
+            _cancel_login_monitor()
+            state = _default_state()
+            chat_server.flight_booking_state = state
+        else:
+            if re.search(r"\b(continue|proceed|next|go ahead|continnue)\b", text, flags=re.IGNORECASE):
+                advanced = await _attempt_post_login_proceed_click()
+                if advanced:
+                    await chat_server.send_to_browser(
+                        "Done. I clicked Continue on the current booking page.",
+                        "status",
+                    )
+                else:
+                    await chat_server.send_to_browser(
+                        "I could not find a Continue button right now. If this page has mandatory fields, share details and I will fill them.",
+                        "agent",
+                    )
+                return True
+            await chat_server.send_to_browser(
+                "Booking is already in progress on provider flow. Share next step details or say 'continue' and I will proceed on this page.",
+                "agent",
+            )
+            return True
+
+    if state.get("stage") == "provider_ready":
+        if _is_new_flight_request(text):
+            _cancel_login_monitor()
+            state = _default_state()
+            chat_server.flight_booking_state = state
+        else:
+            await _ensure_cancellation_prompt(state)
+            cancellation_choice = _extract_cancellation_choice(text)
+            if cancellation_choice:
+                picked = await _apply_cancellation_choice(state, cancellation_choice, announce=True)
+                if not picked:
+                    label = {
+                        "free": "Free Cancellation",
+                        "flex": "Free Cancellation + Rescheduling",
+                        "no": "I don't want Free Cancellation",
+                    }.get(cancellation_choice, "I don't want Free Cancellation")
+                    await chat_server.send_to_browser(
+                        f"I noted your cancellation choice ({label}) but couldn't confirm the click yet.",
+                        "agent",
+                    )
+            details = _extract_passenger_details(text)
+            traveller_names = _extract_traveller_names(text)
+            merged = {**(state.get("passenger_details") or {}), **details}
+            if traveller_names:
+                existing = state.get("selected_travellers") or []
+                merged_names = existing + [n for n in traveller_names if n.lower() not in {x.lower() for x in existing}]
+                state["selected_travellers"] = merged_names
+                merged["selected_travellers"] = merged_names
+            elif state.get("selected_travellers"):
+                merged["selected_travellers"] = state.get("selected_travellers")
+            state["passenger_details"] = merged
+
+            if not _looks_like_passenger_input(text) and not merged:
+                await chat_server.send_to_browser(
+                    "Share passenger details like: Name, Email, Mobile, and Gender. I will fill and continue.",
+                    "agent",
+                )
+                return True
+
+            result = await _fill_passenger_details_on_page(merged, auto_continue=False)
+            if result.get("selected"):
+                await chat_server.send_to_browser(
+                    "Selected traveller(s) from checklist.",
+                    "status",
+                )
+            if result.get("filled"):
+                await chat_server.send_to_browser(
+                    "Passenger details entered on the page.",
+                    "status",
+                )
+
+            target_choice = state.get("cancellation_choice") or "no"
+            cancellation_ok = await _apply_cancellation_choice(state, target_choice, announce=False)
+            if not cancellation_ok:
+                await chat_server.send_to_browser(
+                    "I could not confirm cancellation option selection on page yet. Please select one option once, or reply 1/2/3 and I will retry.",
+                    "agent",
+                )
+                return True
+
+            advanced = await _click_booking_continue_on_page()
+            if advanced:
+                state["stage"] = "done"
+                await chat_server.send_to_browser(
+                    "Continue clicked. I moved to the next booking step.",
+                    "agent",
+                )
+            else:
+                await chat_server.send_to_browser(
+                    "I entered available details. If more fields are required, send remaining details and I will continue.",
+                    "agent",
+                )
+            return True
 
     # Start or continue flow
     if not state.get("active"):
         state["active"] = True
         state["stage"] = "collecting"
         await chat_server.send_to_browser(
-            "I can help with flight booking. I will compare on Ixigo first, then open your chosen booking site.",
+            "I can help with flight booking. Share details naturally, for example: Pune to Delhi on 18 May for 2 adults. I will handle city spellings and format everything correctly.",
             "agent",
         )
 
@@ -416,47 +1630,92 @@ async def handle_flight_chat_message(message: str) -> bool:
     # If already compared, check choice
     if state.get("stage") == "compared":
         options = state.get("options", [])
-        if state.get("auto_book") and options:
+        if _wants_cheapest_booking(text):
+            state["book_cheapest"] = True
+        if state.get("book_cheapest"):
             await chat_server.send_to_browser(
-                "Auto-book mode is on. Applying default sorting and proceeding with the first available option.",
+                "Cheapest-flight request confirmed. Sorting by cheapest and proceeding with the first option.",
                 "status",
             )
-            result = await proceed_with_first_ixigo_option()
+            result = await _attempt_cheapest_click()
             await chat_server.send_to_browser(
                 (
-                    "Booking step executed."
+                    "Cheapest option flow executed."
                     f" Sorted: {'yes' if result.get('sorted') else 'no'}"
-                    f", First option clicked: {'yes' if result.get('clicked') else 'no'}."
+                    f", Option clicked: {'yes' if result.get('clicked') else 'no'}."
+                    + (" (fallback click used)" if result.get("fallback_rank_click") else "")
                 ),
                 "agent",
             )
-            state["stage"] = "done"
+            if result.get("clicked"):
+                await _handle_provider_page_after_open(state)
+            else:
+                if await _is_login_gate_visible():
+                    await _enter_human_login_handoff(state, resume_action="resume_cheapest")
+                else:
+                    state["stage"] = "compared"
+                    await chat_server.send_to_browser(
+                        "I could not click cheapest yet. I kept the results page active, so say 'select cheapest and proceed' to retry immediately.",
+                        "agent",
+                    )
             return True
+
+        raw_choice = _extract_choice_number(text)
         choice = _parse_choice(text, len(options))
-        direct_url = re.search(r"https?://\\S+", text)
+        direct_url = re.search(r"https?://\S+", text)
         if choice:
             selected = options[choice - 1]
             await chat_server.send_to_browser(
                 f"Opening option {choice}: {selected.get('label', 'selected provider')}", "status"
             )
-            await browser_manager.navigate(selected["url"])
+            clicked = await _click_option_choice(selected)
+            if clicked:
+                await chat_server.send_to_browser("Done. I clicked your selected option.", "status")
+                await _handle_provider_page_after_open(state)
+                return True
+            if await _is_login_gate_visible():
+                await _enter_human_login_handoff(
+                    state,
+                    resume_action="resume_selected",
+                    pending_option=selected,
+                )
+                return True
             await chat_server.send_to_browser(
-                "I opened the provider website. Share passenger details in chat and I will continue booking.",
+                "I could not click that option automatically. Please select it on the page and share the opened booking URL.",
                 "agent",
             )
-            state["stage"] = "done"
+            return True
+        if raw_choice > 0 and options:
+            await chat_server.send_to_browser(
+                f"I found {len(options)} option(s) right now. Please choose between option 1 and option {len(options)}.",
+                "agent",
+            )
+            return True
+        if raw_choice > 0 and not options:
+            clicked = await _click_ixigo_option_by_rank(raw_choice - 1)
+            if clicked:
+                await chat_server.send_to_browser("Done. I clicked your selected option.", "status")
+                await _handle_provider_page_after_open(state)
+                return True
+            if await _is_login_gate_visible():
+                await _enter_human_login_handoff(
+                    state,
+                    resume_action="resume_selected",
+                    pending_option={"rank": raw_choice - 1, "kind": "ixigo_click", "label": f"Option {raw_choice}"},
+                )
+                return True
+            await chat_server.send_to_browser(
+                "I could not find that option on screen right now. Please scroll flight results and try again with option number.",
+                "agent",
+            )
             return True
         if direct_url:
             await chat_server.send_to_browser("Opening your provided booking URL now.", "status")
             await browser_manager.navigate(direct_url.group(0))
-            await chat_server.send_to_browser(
-                "Provider site is open. Share passenger details in chat and I will proceed.",
-                "agent",
-            )
-            state["stage"] = "done"
+            await _handle_provider_page_after_open(state)
             return True
         await chat_server.send_to_browser(
-            "Please choose an option like 'option 1' or paste the booking URL you want.",
+            "Please tell me which flight option you want, for example 'option 1', and I will continue.",
             "agent",
         )
         return True
@@ -464,27 +1723,71 @@ async def handle_flight_chat_message(message: str) -> bool:
     missing = _missing_fields(state)
     if missing:
         prompts = {
-            "origin": "departure airport IATA code (example: DEL)",
-            "destination": "destination airport IATA code (example: DXB)",
-            "depart_date": "departure date in YYYY-MM-DD",
-            "return_date": "return date in YYYY-MM-DD",
+            "origin": "departure city or airport",
+            "destination": "destination city or airport",
+            "depart_date": "departure date",
+            "return_date": "return date",
         }
         ask = ", ".join(prompts[m] for m in missing)
         await chat_server.send_to_browser(
-            f"Please provide: {ask}. You can send in one line, e.g. 'from DEL to DXB on 2026-05-15'.",
+            f"I need a bit more information: {ask}. You can write it naturally in one line.",
             "agent",
         )
         return True
 
     # Run comparison
-    url = _build_ixigo_url(state)
-    await chat_server.send_to_browser("Opening Ixigo and loading flight comparison.", "status")
-    await browser_manager.navigate(url)
-    options = await _extract_booking_options()
-    if not options:
-        # Try one automatic interaction to expose provider links.
+    fallback_url = build_ixigo_results_url(state)
+    date_match = re.search(r"[?&]date=(\d{8})\b", fallback_url)
+    compact_date = date_match.group(1) if date_match else "DDMMYYYY"
+    await chat_server.send_to_browser(
+        (
+            "Opening Ixigo homepage and entering details manually now:\n"
+            f"- From: {state['origin']}\n"
+            f"- To: {state['destination']}\n"
+            f"- Date: {state['depart_date']} (Ixigo URL format: {compact_date})"
+            + (f"\n- Return: {state['return_date']}" if state.get("return_date") else "")
+            + f"\n- Adults: {state.get('adults', 1)}\n"
+            "Proceeding to search flights."
+        ),
+        "status",
+    )
+    search_exec = await open_ixigo_and_search_from_home(state)
+    if search_exec.get("manual_search_submitted"):
+        if search_exec.get("normalized_date_applied"):
+            await chat_server.send_to_browser(
+                "Ixigo search was submitted from the homepage form. Final results URL date was normalized to DDMMYYYY.",
+                "status",
+            )
+        else:
+            await chat_server.send_to_browser(
+                "Ixigo search was submitted from the homepage form after entering values on-page.",
+                "status",
+            )
+    elif search_exec.get("fallback_used"):
+        await chat_server.send_to_browser(
+            (
+                "Ixigo form interaction partially succeeded, then I continued with the equivalent search URL "
+                f"using date format {compact_date}."
+            ),
+            "status",
+        )
+
+    options = await _extract_clickable_ixigo_options()
+    if not options and state.get("book_cheapest"):
+        # For cheapest auto-book, one click attempt to expose proceed actions.
         await _open_first_available_flight_offer()
-        options = await _extract_booking_options()
+        options = await _extract_clickable_ixigo_options()
+    # Secondary fallback: provider links (kept only as backup).
+    if not options:
+        link_options = await _extract_booking_options()
+        options = [{**opt, "kind": "external_url"} for opt in link_options]
+    if not options:
+        visible_count = await _count_clickable_ixigo_options(limit=6)
+        if visible_count > 0:
+            options = [
+                {"label": f"Option {i}", "rank": i - 1, "kind": "ixigo_click"}
+                for i in range(1, visible_count + 1)
+            ]
     state["options"] = options
     state["stage"] = "compared"
 
@@ -495,30 +1798,42 @@ async def handle_flight_chat_message(message: str) -> bool:
         f"Passengers: {state.get('adults', 1)} adult(s)",
     ]
     if options:
-        summary.append("Top booking options found:")
-        for i, opt in enumerate(options, start=1):
-            summary.append(f"{i}. {opt.get('label', 'Option')} — {opt.get('url')}")
-        summary.append("Reply with 'option 1' (or another number) to continue booking on that website.")
-        if state.get("auto_book"):
-            summary.append("Auto-book is enabled. I will now sort by default and proceed with first option.")
-            await chat_server.send_to_browser("\n".join(summary), "agent")
+        if state.get("book_cheapest"):
             await chat_server.send_to_browser(
-                "Applying default sorting and proceeding with first option on Ixigo.",
+                "You asked for cheapest flight, so I am now proceeding automatically.",
                 "status",
             )
-            result = await proceed_with_first_ixigo_option()
+            result = await _attempt_cheapest_click()
             await chat_server.send_to_browser(
                 (
-                    "Auto-book execution complete."
+                    "Cheapest option flow executed."
                     f" Sorted: {'yes' if result.get('sorted') else 'no'}"
-                    f", First option clicked: {'yes' if result.get('clicked') else 'no'}."
+                    f", Option clicked: {'yes' if result.get('clicked') else 'no'}."
+                    + (" (fallback click used)" if result.get("fallback_rank_click") else "")
                 ),
                 "agent",
             )
-            state["stage"] = "done"
+            if result.get("clicked"):
+                await _handle_provider_page_after_open(state)
+            else:
+                if await _is_login_gate_visible():
+                    await _enter_human_login_handoff(state, resume_action="resume_cheapest")
+                else:
+                    state["stage"] = "compared"
+                    await chat_server.send_to_browser(
+                        "I could not click cheapest yet. I kept the results page active, so say 'select cheapest and proceed' to retry immediately.",
+                        "agent",
+                    )
             return True
+        summary.append("Top booking options found:")
+        for i, opt in enumerate(options, start=1):
+            if opt.get("kind") == "external_url" and opt.get("url"):
+                summary.append(f"{i}. {opt.get('label', 'Option')} — {opt.get('url')}")
+            else:
+                summary.append(f"{i}. {opt.get('label', 'Option')}")
+        summary.append("Tell me which one to proceed with, for example 'option 1'.")
     else:
-        summary.append("I could not extract provider links automatically. Please pick a result in browser and paste its URL here.")
+        summary.append("Results are loaded. Say 'book cheapest flight' or share the opened booking URL from the option you choose.")
 
     await chat_server.send_to_browser("\n".join(summary), "agent")
     return True

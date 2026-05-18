@@ -55,6 +55,21 @@ CHAT_WIDGET_JS = """
         #agentic-chat-bubble svg {
             width: 26px; height: 26px; fill: white;
         }
+        #agentic-chat-bubble-badge {
+            position: absolute;
+            top: 4px;
+            right: 4px;
+            width: 11px;
+            height: 11px;
+            border-radius: 50%;
+            background: #ef4444;
+            border: 2px solid #ffffff;
+            box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.25);
+            display: none;
+        }
+        #agentic-chat-bubble-badge.show {
+            display: block;
+        }
         #agentic-chat-panel {
             position: absolute;
             right: 0;
@@ -305,10 +320,36 @@ CHAT_WIDGET_JS = """
             box-shadow: 0 2px 12px rgba(99,102,241,0.4);
         }
         #agentic-chat-send svg { width: 18px; height: 18px; fill: white; }
+        #agentic-chat-mic, #agentic-chat-voice-read {
+            width: 40px;
+            height: 40px;
+            border-radius: 12px;
+            border: 1px solid rgba(139,92,246,0.25);
+            background: rgba(255,255,255,0.08);
+            color: #e5e7eb;
+            cursor: pointer;
+            flex-shrink: 0;
+        }
+        #agentic-chat-mic.listening {
+            border-color: rgba(52,211,153,0.7);
+            box-shadow: 0 0 0 2px rgba(52,211,153,0.18);
+            color: #86efac;
+        }
+        #agentic-chat-voice-wrap {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            color: #c8c8ef;
+            font-size: 11px;
+        }
+        #agentic-chat-auto-tts {
+            accent-color: #8b5cf6;
+        }
     </style>
 
     <div id="agentic-chat-bubble">
         <svg viewBox="0 0 24 24"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H6l-2 2V4h16v12z"/></svg>
+        <span id="agentic-chat-bubble-badge"></span>
     </div>
 
     <div id="agentic-chat-panel">
@@ -338,7 +379,9 @@ CHAT_WIDGET_JS = """
             </div>
             <div id="agentic-chat-composer">
                 <input id="agentic-chat-input" type="text" placeholder="Ask me anything..." autocomplete="off"/>
-                <button id="agentic-chat-send">
+                <button id="agentic-chat-mic" type="button" title="Voice input">🎤</button>
+                <button id="agentic-chat-voice-read" type="button" title="Read last response">🔊</button>
+                <button id="agentic-chat-send" type="button">
                     <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
                 </button>
             </div>
@@ -346,6 +389,10 @@ CHAT_WIDGET_JS = """
                 <div id="agentic-chat-loop-wrap">
                     <label for="agentic-chat-loop-limit">Loop limit</label>
                     <input id="agentic-chat-loop-limit" type="number" min="1" step="1" value="3"/>
+                </div>
+                <div id="agentic-chat-voice-wrap">
+                    <input id="agentic-chat-auto-tts" type="checkbox"/>
+                    <label for="agentic-chat-auto-tts">Auto read replies</label>
                 </div>
             </div>
         </div>
@@ -356,6 +403,7 @@ CHAT_WIDGET_JS = """
     // ── Logic ──
     const bubble = document.getElementById('agentic-chat-bubble');
     const panel = document.getElementById('agentic-chat-panel');
+    const bubbleBadge = document.getElementById('agentic-chat-bubble-badge');
     const msgs = document.getElementById('agentic-chat-messages');
     const msgsWrap = document.getElementById('agentic-chat-messages-wrap');
     const stateWrap = document.getElementById('agentic-chat-state-wrap');
@@ -365,6 +413,9 @@ CHAT_WIDGET_JS = """
     const input = document.getElementById('agentic-chat-input');
     const loopLimitInput = document.getElementById('agentic-chat-loop-limit');
     const sendBtn = document.getElementById('agentic-chat-send');
+    const micBtn = document.getElementById('agentic-chat-mic');
+    const voiceReadBtn = document.getElementById('agentic-chat-voice-read');
+    const autoTtsCheckbox = document.getElementById('agentic-chat-auto-tts');
     const providerSelect = document.getElementById('agentic-chat-provider');
     const modelSelect = document.getElementById('agentic-chat-model');
 
@@ -389,8 +440,18 @@ CHAT_WIDGET_JS = """
     const LOOP_LIMIT_KEY = 'agentic-chat-loop-limit';
     const MSGS_DROPDOWN_KEY = 'agentic-chat-messages-open';
     const STATE_DROPDOWN_KEY = 'agentic-chat-state-open';
+    const AUTO_TTS_KEY = 'agentic-chat-auto-tts';
     let latestAgentState = {};
     let latestUiState = {};
+    let hasUnreadBotMessage = false;
+    let lastAgentMessage = '';
+    let recognition = null;
+    let recognizing = false;
+
+    function setUnreadBadge(show) {
+        hasUnreadBotMessage = Boolean(show);
+        bubbleBadge.classList.toggle('show', hasUnreadBotMessage);
+    }
 
     function getStored(key, fallback = '') {
         try {
@@ -449,9 +510,11 @@ CHAT_WIDGET_JS = """
     const savedPanelOpenRaw = getStored(PANEL_KEY, 'closed');
     const hasSavedPanelState = savedPanelOpenRaw === 'open' || savedPanelOpenRaw === 'closed';
     const savedPanelOpen = savedPanelOpenRaw === 'open';
+    const savedAutoTts = getStored(AUTO_TTS_KEY, 'off') === 'on';
     providerSelect.value = MODEL_OPTIONS[savedProvider] ? savedProvider : 'google';
     populateModels(providerSelect.value, savedModel);
     loopLimitInput.value = String(Number.isFinite(savedLoopLimit) && savedLoopLimit > 0 ? savedLoopLimit : 3);
+    autoTtsCheckbox.checked = savedAutoTts;
 
     providerSelect.addEventListener('change', () => {
         populateModels(providerSelect.value);
@@ -580,6 +643,76 @@ CHAT_WIDGET_JS = """
         div.textContent = text;
         msgs.appendChild(div);
         msgs.scrollTop = msgs.scrollHeight;
+        if (type === 'agent' || type === 'system' || type === 'status') {
+            lastAgentMessage = String(text || '');
+            if (autoTtsCheckbox.checked) {
+                speakText(lastAgentMessage);
+            }
+        }
+        if (!isPanelOpen && type !== 'user') {
+            setUnreadBadge(true);
+        }
+    }
+
+    function speakText(text) {
+        const val = String(text || '').trim();
+        if (!val || !window.speechSynthesis) {
+            addMessage('Text-to-speech is not available in this browser.', 'system');
+            return;
+        }
+        try {
+            window.speechSynthesis.cancel();
+            const u = new SpeechSynthesisUtterance(val);
+            u.lang = 'en-US';
+            u.rate = 1.0;
+            u.pitch = 1.0;
+            window.speechSynthesis.speak(u);
+        } catch (e) {
+            addMessage('Unable to play audio response right now.', 'system');
+        }
+    }
+
+    function initVoiceInput() {
+        const Ctor = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!Ctor) {
+            micBtn.disabled = true;
+            micBtn.title = 'Voice input unsupported in this browser';
+            addMessage('Voice input is not supported in this browser build.', 'system');
+            return;
+        }
+        recognition = new Ctor();
+        recognition.lang = 'en-US';
+        recognition.interimResults = false;
+        recognition.maxAlternatives = 1;
+        recognition.continuous = false;
+
+        recognition.onstart = () => {
+            recognizing = true;
+            micBtn.classList.add('listening');
+        };
+        recognition.onend = () => {
+            recognizing = false;
+            micBtn.classList.remove('listening');
+        };
+        recognition.onerror = (evt) => {
+            const code = evt && evt.error ? String(evt.error) : 'unknown_error';
+            if (code === 'not-allowed' || code === 'service-not-allowed') {
+                addMessage('Microphone permission is blocked. Allow mic access and try again.', 'system');
+            } else if (code === 'no-speech') {
+                addMessage('No speech detected. Try speaking again.', 'system');
+            } else {
+                addMessage(`Voice input error: ${code}`, 'system');
+            }
+        };
+        recognition.onresult = (evt) => {
+            const transcript = evt && evt.results && evt.results[0] && evt.results[0][0]
+                ? (evt.results[0][0].transcript || '')
+                : '';
+            if (!transcript) return;
+            const base = input.value.trim();
+            input.value = base ? (base + ' ' + transcript) : transcript;
+            input.focus();
+        };
     }
 
     function sendMessage() {
@@ -628,6 +761,7 @@ CHAT_WIDGET_JS = """
             connectWS();
         }
         if (open) {
+            setUnreadBadge(false);
             setTimeout(() => input.focus(), 100);
         }
     }
@@ -639,6 +773,22 @@ CHAT_WIDGET_JS = """
     });
 
     sendBtn.addEventListener('click', sendMessage);
+    micBtn.addEventListener('click', () => {
+        if (!recognition) return;
+        if (recognizing) {
+            try { recognition.stop(); } catch (e) {}
+            return;
+        }
+        try { recognition.start(); } catch (e) {
+            addMessage('Unable to start voice input. Check microphone permission.', 'system');
+        }
+    });
+    voiceReadBtn.addEventListener('click', () => {
+        speakText(lastAgentMessage);
+    });
+    autoTtsCheckbox.addEventListener('change', () => {
+        setStored(AUTO_TTS_KEY, autoTtsCheckbox.checked ? 'on' : 'off');
+    });
     input.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') sendMessage();
     });
@@ -652,6 +802,7 @@ CHAT_WIDGET_JS = """
     setSectionOpen('messages', getStored(MSGS_DROPDOWN_KEY, 'open') === 'open');
     setSectionOpen('state', getStored(STATE_DROPDOWN_KEY, 'closed') === 'open');
     renderState();
+    initVoiceInput();
     setPanelOpen(savedPanelOpen, false);
     connectWS();
 })();
