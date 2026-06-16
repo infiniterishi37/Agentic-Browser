@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 from datetime import date, timedelta
 from difflib import get_close_matches
@@ -47,6 +48,7 @@ def _default_state() -> dict:
         "cancellation_prompted": False,
         "cancellation_choice": "",  # no | free | flex
         "cancellation_applied": False,
+        "passenger_pre_prompted": False,  # whether we already asked for passenger details upfront
     }
 
 
@@ -94,7 +96,7 @@ def _norm_date(raw: str) -> str:
 
 
 CITY_TO_IATA = {
-    # India (common routes)
+    # India — comprehensive
     "pune": "PNQ",
     "delhi": "DEL",
     "new delhi": "DEL",
@@ -105,9 +107,39 @@ CITY_TO_IATA = {
     "bengaluru": "BLR",
     "hyderabad": "HYD",
     "chennai": "MAA",
+    "madras": "MAA",
     "kolkata": "CCU",
+    "calcutta": "CCU",
     "ahmedabad": "AMD",
     "goa": "GOI",
+    "ranchi": "IXR",
+    "patna": "PAT",
+    "lucknow": "LKO",
+    "kochi": "COK",
+    "cochin": "COK",
+    "coimbatore": "CJB",
+    "indore": "IDR",
+    "varanasi": "VNS",
+    "bhopal": "BHO",
+    "srinagar": "SXR",
+    "chandigarh": "IXC",
+    "amritsar": "ATQ",
+    "nagpur": "NAG",
+    "visakhapatnam": "VTZ",
+    "vizag": "VTZ",
+    "thiruvananthapuram": "TRV",
+    "trivandrum": "TRV",
+    "guwahati": "GAU",
+    "agartala": "IXA",
+    "imphal": "IMF",
+    "port blair": "IXZ",
+    "leh": "IXL",
+    "jammu": "IXJ",
+    "shimla": "SLV",
+    "udaipur": "UDR",
+    "jodhpur": "JDH",
+    "dehradun": "DED",
+    "jaipur": "JAI",
 }
 
 MONTHS = {
@@ -612,14 +644,29 @@ async def _fill_passenger_details_on_page(details: dict, auto_continue: bool = F
                 const clean = (x) => String(x || '').trim();
                 const findInput = (patterns) => {
                     const inputs = Array.from(document.querySelectorAll("input, textarea")).filter(isVisible);
+                    // Fast-path for semantic types first.
+                    if (patterns.some((p) => p.includes('email'))) {
+                        const emailTyped = inputs.find((el) =>
+                            String(el.getAttribute('type') || '').toLowerCase() === 'email'
+                        );
+                        if (emailTyped) return emailTyped;
+                    }
+                    if (patterns.some((p) => p.includes('phone') || p.includes('mobile') || p.includes('contact'))) {
+                        const telTyped = inputs.find((el) =>
+                            ['tel', 'number'].includes(String(el.getAttribute('type') || '').toLowerCase())
+                        );
+                        if (telTyped) return telTyped;
+                    }
                     for (const el of inputs) {
                         if (el.closest('#agentic-chat-root')) continue;
+                        const container = el.closest('div, section, article, form') || el.parentElement || el;
                         const hay = [
                             el.getAttribute('name') || '',
                             el.getAttribute('id') || '',
                             el.getAttribute('placeholder') || '',
                             el.getAttribute('aria-label') || '',
                             el.labels && el.labels[0] ? (el.labels[0].innerText || '') : '',
+                            (container.innerText || '').slice(0, 220),
                         ].join(' ').toLowerCase();
                         if (patterns.some((p) => hay.includes(p))) return el;
                     }
@@ -628,11 +675,39 @@ async def _fill_passenger_details_on_page(details: dict, auto_continue: bool = F
                 const setVal = (el, value) => {
                     if (!el || !value) return false;
                     el.focus();
-                    el.value = '';
+                    const proto = Object.getPrototypeOf(el);
+                    const valueSetter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                    if (valueSetter) {
+                        valueSetter.call(el, '');
+                    } else {
+                        el.value = '';
+                    }
                     el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.value = value;
+                    if (valueSetter) {
+                        valueSetter.call(el, value);
+                    } else {
+                        el.value = value;
+                    }
+                    el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'a' }));
+                    el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'a' }));
+                    el.dispatchEvent(new Event('beforeinput', { bubbles: true }));
                     el.dispatchEvent(new Event('input', { bubbles: true }));
                     el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('blur', { bubbles: true }));
+                    return clean(el.value) === clean(value);
+                };
+                const setByLabel = (labelText, value) => {
+                    if (!value) return false;
+                    const target = norm(labelText);
+                    const labels = Array.from(document.querySelectorAll('label, div, span, p, h4')).filter(isVisible);
+                    for (const node of labels) {
+                        if (node.closest('#agentic-chat-root')) continue;
+                        const txt = norm(node.innerText || node.textContent || '');
+                        if (!txt || !txt.includes(target)) continue;
+                        const block = node.closest('div, section, article, form') || node.parentElement || node;
+                        const field = block.querySelector('input, textarea');
+                        if (field && isVisible(field) && setVal(field, value)) return true;
+                    }
                     return true;
                 };
                 const norm = (v) => String(v || '').toLowerCase().replace(/[^a-z]/g, ' ').replace(/\\s+/g, ' ').trim();
@@ -683,6 +758,9 @@ async def _fill_passenger_details_on_page(details: dict, auto_continue: bool = F
                 }
                 if (clean(details.email)) {
                     filledAny = setVal(findInput(['email', 'e-mail']), clean(details.email)) || filledAny;
+                    if (!filledAny) {
+                        filledAny = setByLabel('email', clean(details.email)) || filledAny;
+                    }
                 }
                 if (clean(details.phone)) {
                     filledAny = setVal(findInput(['phone', 'mobile', 'contact']), clean(details.phone)) || filledAny;
@@ -736,6 +814,311 @@ def _extract_cancellation_choice(text: str) -> str:
     if re.search(r"\b(3|no|don't want|do not want|skip|without cancellation)\b", s):
         return "no"
     return ""
+
+
+def _compact_text(text: str, max_chars: int) -> str:
+    s = (text or "").strip()
+    if len(s) <= max_chars:
+        return s
+    head = int(max_chars * 0.7)
+    tail = max_chars - head
+    return s[:head] + "\n...[truncated]...\n" + s[-tail:]
+
+
+def _compact_chat_history(limit: int = 30) -> str:
+    entries = (chat_server.history or [])[-max(1, limit):]
+    lines: list[str] = []
+    for item in entries:
+        typ = str(item.get("type", "")).strip() or "unknown"
+        content = str(item.get("content", "")).strip()
+        if not content:
+            continue
+        lines.append(f"{typ.upper()}: {content}")
+    return "\n".join(lines)
+
+
+async def _get_provider_page_snapshot() -> dict:
+    page = browser_manager.page
+    if not page:
+        return {"url": "", "title": "", "inputs": [], "buttons": [], "excerpt": ""}
+    try:
+        url = page.url
+    except Exception:
+        url = ""
+    try:
+        title = await page.title()
+    except Exception:
+        title = ""
+    try:
+        snap = await page.evaluate(
+            """() => {
+                const isVisible = (el) => {
+                    const cs = window.getComputedStyle(el);
+                    if (!cs || cs.display === 'none' || cs.visibility === 'hidden' || Number(cs.opacity || '1') === 0) return false;
+                    const r = el.getBoundingClientRect();
+                    return !!r && r.width > 8 && r.height > 8;
+                };
+                const cleaned = (v) => String(v || '').replace(/\\s+/g, ' ').trim();
+                const inChat = (el) => !!el.closest('#agentic-chat-root');
+
+                const inputs = Array.from(document.querySelectorAll('input, textarea, select'))
+                    .filter((el) => isVisible(el) && !inChat(el))
+                    .slice(0, 24)
+                    .map((el) => ({
+                        type: cleaned(el.getAttribute('type') || el.tagName.toLowerCase()),
+                        name: cleaned(el.getAttribute('name')),
+                        id: cleaned(el.getAttribute('id')),
+                        placeholder: cleaned(el.getAttribute('placeholder')),
+                        aria: cleaned(el.getAttribute('aria-label')),
+                        value: cleaned(el.value),
+                    }));
+
+                const buttons = Array.from(document.querySelectorAll('button, a, [role="button"], [role="radio"], label'))
+                    .filter((el) => isVisible(el) && !inChat(el))
+                    .map((el) => cleaned(el.innerText || el.textContent || el.getAttribute('aria-label')))
+                    .filter(Boolean)
+                    .slice(0, 40);
+
+                const bodyText = cleaned(document.body ? (document.body.innerText || document.body.textContent || '') : '');
+                return {
+                    inputs,
+                    buttons,
+                    excerpt: bodyText.slice(0, 2600),
+                };
+            }"""
+        )
+    except Exception:
+        snap = {"inputs": [], "buttons": [], "excerpt": ""}
+    return {
+        "url": url,
+        "title": title,
+        "inputs": snap.get("inputs", []) if isinstance(snap, dict) else [],
+        "buttons": snap.get("buttons", []) if isinstance(snap, dict) else [],
+        "excerpt": snap.get("excerpt", "") if isinstance(snap, dict) else "",
+    }
+
+
+async def _llm_choose_provider_action(
+    *,
+    user_message: str,
+    state: dict,
+    merged_details: dict,
+) -> dict:
+    try:
+        llm = get_llm(
+            provider=chat_server.selected_provider,
+            model=chat_server.selected_model,
+        )
+        snapshot = await _get_provider_page_snapshot()
+        history_text = _compact_chat_history(limit=int(os.getenv("FLIGHT_HISTORY_LINES", "40")))
+        prompt = (
+            "You are an autonomous flight booking execution controller.\n"
+            "Choose the next best action for the current provider booking page.\n\n"
+            "Return STRICT JSON only with schema:\n"
+            "{"
+            "\"action\":\"fill_details|select_cancellation|click_continue|ask_user|wait\","
+            "\"reason\":\"string\","
+            "\"cancellation_choice\":\"free|flex|no|\","
+            "\"message\":\"string\""
+            "}\n\n"
+            "Rules:\n"
+            "- Prefer progressing the booking without asking user again unless blocked by mandatory missing data.\n"
+            "- If email/phone/name fields are visible and details exist, choose fill_details.\n"
+            "- If cancellation section is visible but uncertain, choose select_cancellation with no by default.\n"
+            "- If details seem filled and a Continue/Proceed/Next button is visible, choose click_continue.\n"
+            "- Choose ask_user only when required data is missing.\n\n"
+            f"Current user message: {user_message}\n"
+            f"State cancellation_choice: {state.get('cancellation_choice', '')}\n"
+            f"Known merged details JSON: {json.dumps(merged_details, ensure_ascii=True)}\n"
+            f"Chat history:\n{_compact_text(history_text, int(os.getenv('FLIGHT_HISTORY_CHARS', '5000')))}\n\n"
+            f"Page URL: {snapshot.get('url', '')}\n"
+            f"Page title: {snapshot.get('title', '')}\n"
+            f"Visible inputs JSON: {json.dumps(snapshot.get('inputs', []), ensure_ascii=True)}\n"
+            f"Visible buttons/labels JSON: {json.dumps(snapshot.get('buttons', []), ensure_ascii=True)}\n"
+            f"Page excerpt:\n{_compact_text(str(snapshot.get('excerpt', '')), int(os.getenv('FLIGHT_PAGE_CHARS', '3500')))}\n"
+        )
+        resp = await llm.ainvoke(prompt)
+        raw = (resp.content or "").strip()
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return {}
+        return data
+    except Exception:
+        return {}
+
+
+def _merge_passenger_state(state: dict, text: str) -> dict:
+    details = _extract_passenger_details(text)
+    traveller_names = _extract_traveller_names(text)
+    merged = {**(state.get("passenger_details") or {}), **details}
+    if traveller_names:
+        existing = state.get("selected_travellers") or []
+        merged_names = existing + [n for n in traveller_names if n.lower() not in {x.lower() for x in existing}]
+        state["selected_travellers"] = merged_names
+        merged["selected_travellers"] = merged_names
+    elif state.get("selected_travellers"):
+        merged["selected_travellers"] = state.get("selected_travellers")
+    state["passenger_details"] = merged
+    return merged
+
+
+async def _llm_plan_provider_actions(
+    *,
+    user_message: str,
+    state: dict,
+    merged_details: dict,
+) -> list[dict]:
+    try:
+        llm = get_llm(
+            provider=chat_server.selected_provider,
+            model=chat_server.selected_model,
+        )
+        snapshot = await _get_provider_page_snapshot()
+        history_text = _compact_chat_history(limit=int(os.getenv("FLIGHT_HISTORY_LINES", "40")))
+        prompt = (
+            "You are a flight-booking planner for an autonomous browser agent.\n"
+            "Given current page state and chat context, return a short action plan to execute NOW.\n"
+            "Return STRICT JSON object only:\n"
+            "{"
+            "\"plan\":["
+            "{\"action\":\"fill_details|select_cancellation|click_continue|ask_user|wait\",\"cancellation_choice\":\"free|flex|no|\",\"message\":\"\"}"
+            "]"
+            "}\n"
+            "Rules:\n"
+            "- Max 4 actions.\n"
+            "- Prefer progressing without asking user unless mandatory details are missing.\n"
+            "- On Add-ons/Seat/Meal pages, prefer click_continue.\n"
+            "- If visible contact fields and data exists, include fill_details before click_continue.\n"
+            "- If cancellation options are visible, include select_cancellation with 'no' unless user asked otherwise.\n"
+            f"Current user message: {user_message}\n"
+            f"State stage: {state.get('stage', '')}\n"
+            f"State cancellation_choice: {state.get('cancellation_choice', '')}\n"
+            f"Merged details JSON: {json.dumps(merged_details, ensure_ascii=True)}\n"
+            f"Chat history:\n{_compact_text(history_text, int(os.getenv('FLIGHT_HISTORY_CHARS', '5000')))}\n"
+            f"Page URL: {snapshot.get('url', '')}\n"
+            f"Page title: {snapshot.get('title', '')}\n"
+            f"Visible inputs JSON: {json.dumps(snapshot.get('inputs', []), ensure_ascii=True)}\n"
+            f"Visible buttons/labels JSON: {json.dumps(snapshot.get('buttons', []), ensure_ascii=True)}\n"
+            f"Page excerpt:\n{_compact_text(str(snapshot.get('excerpt', '')), int(os.getenv('FLIGHT_PAGE_CHARS', '3500')))}\n"
+        )
+        resp = await llm.ainvoke(prompt)
+        raw = (resp.content or "").strip()
+        data = json.loads(raw)
+        plan = data.get("plan", []) if isinstance(data, dict) else []
+        if not isinstance(plan, list):
+            return []
+        out = []
+        allowed = {"fill_details", "select_cancellation", "click_continue", "ask_user", "wait"}
+        for step in plan[:4]:
+            if not isinstance(step, dict):
+                continue
+            action = str(step.get("action", "")).strip().lower()
+            if action not in allowed:
+                continue
+            out.append(step)
+        return out
+    except Exception:
+        return []
+
+
+async def _execute_provider_plan(
+    *,
+    state: dict,
+    merged_details: dict,
+    plan: list[dict],
+) -> dict:
+    did_fill = False
+    did_select = False
+    did_advance = False
+    for step in plan:
+        action = str(step.get("action", "")).strip().lower()
+        if action == "fill_details" and merged_details:
+            result = await _fill_passenger_details_on_page(merged_details, auto_continue=False)
+            if result.get("selected"):
+                did_select = True
+                await chat_server.send_to_browser("Selected traveller(s) from checklist.", "status")
+            if result.get("filled"):
+                did_fill = True
+                await chat_server.send_to_browser("Passenger/contact details entered on the page.", "status")
+        elif action == "select_cancellation":
+            choice = str(step.get("cancellation_choice", "")).strip().lower() or state.get("cancellation_choice") or "no"
+            ok = await _apply_cancellation_choice(state, choice, announce=True)
+            did_select = did_select or ok
+        elif action == "click_continue":
+            advanced = await _click_booking_continue_on_page()
+            did_advance = did_advance or advanced
+            if advanced:
+                break
+        elif action == "ask_user":
+            msg = str(step.get("message", "")).strip() or "Please share any required details shown on the page so I can continue."
+            await chat_server.send_to_browser(msg, "agent")
+            return {"asked_user": True, "advanced": False, "filled": did_fill, "selected": did_select}
+
+    return {"asked_user": False, "advanced": did_advance, "filled": did_fill, "selected": did_select}
+
+
+def _plan_requires_user(plan: list[dict]) -> bool:
+    for step in plan:
+        if str(step.get("action", "")).strip().lower() == "ask_user":
+            return True
+    return False
+
+
+async def _auto_progress_provider_flow(state: dict, user_message: str) -> dict:
+    """
+    Repeatedly scrape->plan->execute until blocked or iteration cap.
+    Stops only when user input is required or no forward movement is possible.
+    """
+    max_iters = int(os.getenv("FLIGHT_AUTO_PROGRESS_ITERS", "6"))
+    if max_iters < 1:
+        max_iters = 1
+
+    any_advanced = False
+    any_filled = False
+    any_selected = False
+    asked_user = False
+
+    for _ in range(max_iters):
+        merged = _merge_passenger_state(state, user_message)
+        plan = await _llm_plan_provider_actions(
+            user_message=user_message,
+            state=state,
+            merged_details=merged,
+        )
+        if not plan:
+            plan = [{"action": "fill_details"}, {"action": "click_continue"}]
+
+        if _plan_requires_user(plan):
+            asked_user = True
+            break
+
+        result = await _execute_provider_plan(state=state, merged_details=merged, plan=plan)
+        any_advanced = any_advanced or bool(result.get("advanced"))
+        any_filled = any_filled or bool(result.get("filled"))
+        any_selected = any_selected or bool(result.get("selected"))
+        if result.get("asked_user"):
+            asked_user = True
+            break
+
+        # Keep trying to auto-apply default cancellation when relevant.
+        if not state.get("cancellation_applied"):
+            target_choice = state.get("cancellation_choice") or "no"
+            await _apply_cancellation_choice(state, target_choice, announce=False)
+
+        # If we progressed a page, run another iteration with fresh scrape.
+        if any_advanced:
+            await asyncio.sleep(0.9)
+            continue
+
+        # No forward progress this iteration, stop loop.
+        break
+
+    return {
+        "advanced": any_advanced,
+        "filled": any_filled,
+        "selected": any_selected,
+        "asked_user": asked_user,
+    }
 
 
 async def _select_cancellation_on_page(choice: str) -> bool:
@@ -997,12 +1380,28 @@ async def _click_booking_continue_on_page() -> bool:
     page = browser_manager.page
     if not page:
         return False
+    side_actions = await _click_side_panel_sequence()
+    if side_actions:
+        return True
     selectors = [
         "button:text-is('Continue')",
         "[role='button']:text-is('Continue')",
         "a:text-is('Continue')",
         "button:has-text('Continue')",
         "[role='button']:has-text('Continue')",
+        "button:has-text('Proceed')",
+        "[role='button']:has-text('Proceed')",
+        "button:has-text('Next')",
+        "[role='button']:has-text('Next')",
+        "button:has-text('Meal Selection')",
+        "[role='button']:has-text('Meal Selection')",
+        "button:has-text('Skip')",
+        "[role='button']:has-text('Skip')",
+        "button:has-text('No Thanks')",
+        "[role='button']:has-text('No Thanks')",
+        "button:has-text('Payment')",
+        "[role='button']:has-text('Payment')",
+        "a:has-text('Payment')",
     ]
     for sel in selectors:
         try:
@@ -1029,6 +1428,91 @@ async def _click_booking_continue_on_page() -> bool:
         except Exception:
             continue
     return False
+
+
+async def _click_side_panel_sequence() -> list[str]:
+    """
+    Try right-side panel/modal CTAs in sequence:
+    Confirm -> No Thanks -> Continue/Proceed/Payment.
+    Returns list of clicked labels.
+    """
+    page = browser_manager.page
+    if not page:
+        return []
+    try:
+        clicked = await page.evaluate(
+            """async () => {
+                const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+                const isVisible = (el) => {
+                    const cs = window.getComputedStyle(el);
+                    if (!cs || cs.display === 'none' || cs.visibility === 'hidden' || Number(cs.opacity || '1') === 0) return false;
+                    const r = el.getBoundingClientRect();
+                    return !!r && r.width > 8 && r.height > 8;
+                };
+                const inChat = (el) => !!el.closest('#agentic-chat-root');
+                const textOf = (el) => String(el.innerText || el.textContent || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+                const norm = (s) => String(s || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+                const clickEl = async (el) => {
+                    if (!el || !isVisible(el) || inChat(el)) return false;
+                    try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (e) {}
+                    try {
+                        el.click();
+                    } catch (e) {
+                        try {
+                            el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                            el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                            el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                        } catch (e2) {
+                            return false;
+                        }
+                    }
+                    await sleep(500);
+                    return true;
+                };
+
+                const containers = Array.from(document.querySelectorAll('aside, [role="dialog"], [aria-modal="true"], .drawer, .modal, .sidebar, .panel, section, div'));
+                const clickableIn = (root) => Array.from(root.querySelectorAll('button, a, [role="button"], span, div'))
+                    .filter((el) => isVisible(el) && !inChat(el))
+                    .filter((el) => {
+                        const t = norm(textOf(el));
+                        return !!t && t.length <= 80;
+                    });
+
+                const priority = ['confirm', 'no thanks', 'continue', 'proceed', 'next', 'payment', 'meal selection', 'skip'];
+                const clicked = [];
+
+                // Two passes allow newly opened prompts (e.g., Confirm -> No Thanks)
+                for (let pass = 0; pass < 2; pass++) {
+                    let didAny = false;
+                    const roots = [document.body, ...containers];
+                    for (const key of priority) {
+                        let target = null;
+                        for (const root of roots) {
+                            const cands = clickableIn(root);
+                            for (const el of cands) {
+                                const t = norm(textOf(el));
+                                if (!t.includes(key)) continue;
+                                if (t.includes('lock price')) continue;
+                                target = el;
+                                break;
+                            }
+                            if (target) break;
+                        }
+                        if (target && await clickEl(target)) {
+                            clicked.push(key);
+                            didAny = true;
+                        }
+                    }
+                    if (!didAny) break;
+                }
+                return clicked;
+            }"""
+        )
+        if isinstance(clicked, list):
+            return [str(x) for x in clicked if str(x).strip()]
+    except Exception:
+        return []
+    return []
 
 
 async def _ensure_cancellation_prompt(state: dict) -> None:
@@ -1093,13 +1577,16 @@ async def _wait_for_login_and_proceed() -> None:
         _flight_login_task = None
 
 
-async def _llm_extract_fields(text: str) -> dict:
+async def _llm_extract_fields(text: str, provider: str = "", model: str = "") -> dict:
     """
     LLM fallback parser for natural-language flight booking details.
     Returns normalized partial fields.
     """
     try:
-        llm = get_llm()
+        llm = get_llm(
+            provider=provider or chat_server.selected_provider,
+            model=model or chat_server.selected_model,
+        )
         prompt = (
             "Extract flight-booking fields from user text.\n"
             "Return ONLY strict JSON with keys:\n"
@@ -1517,21 +2004,21 @@ async def handle_flight_chat_message(message: str) -> bool:
             state = _default_state()
             chat_server.flight_booking_state = state
         else:
-            if re.search(r"\b(continue|proceed|next|go ahead|continnue)\b", text, flags=re.IGNORECASE):
-                advanced = await _attempt_post_login_proceed_click()
-                if advanced:
-                    await chat_server.send_to_browser(
-                        "Done. I clicked Continue on the current booking page.",
-                        "status",
-                    )
-                else:
-                    await chat_server.send_to_browser(
-                        "I could not find a Continue button right now. If this page has mandatory fields, share details and I will fill them.",
-                        "agent",
-                    )
+            result = await _auto_progress_provider_flow(state, text)
+            if result.get("asked_user"):
+                return True
+            if result.get("advanced"):
+                await chat_server.send_to_browser("Done. I continued to the next booking step.", "status")
+                return True
+            merged = state.get("passenger_details") or {}
+            if not result.get("filled") and not merged and not _looks_like_passenger_input(text):
+                await chat_server.send_to_browser(
+                    "Share required details shown on page (for example email/date of birth) and I will fill them now.",
+                    "agent",
+                )
                 return True
             await chat_server.send_to_browser(
-                "Booking is already in progress on provider flow. Share next step details or say 'continue' and I will proceed on this page.",
+                "I evaluated the current page and could not advance yet. Share the missing field visible on screen and I will fill it.",
                 "agent",
             )
             return True
@@ -1556,58 +2043,27 @@ async def handle_flight_chat_message(message: str) -> bool:
                         f"I noted your cancellation choice ({label}) but couldn't confirm the click yet.",
                         "agent",
                     )
-            details = _extract_passenger_details(text)
-            traveller_names = _extract_traveller_names(text)
-            merged = {**(state.get("passenger_details") or {}), **details}
-            if traveller_names:
-                existing = state.get("selected_travellers") or []
-                merged_names = existing + [n for n in traveller_names if n.lower() not in {x.lower() for x in existing}]
-                state["selected_travellers"] = merged_names
-                merged["selected_travellers"] = merged_names
-            elif state.get("selected_travellers"):
-                merged["selected_travellers"] = state.get("selected_travellers")
-            state["passenger_details"] = merged
-
-            if not _looks_like_passenger_input(text) and not merged:
-                await chat_server.send_to_browser(
-                    "Share passenger details like: Name, Email, Mobile, and Gender. I will fill and continue.",
-                    "agent",
-                )
+            result = await _auto_progress_provider_flow(state, text)
+            if result.get("asked_user"):
                 return True
-
-            result = await _fill_passenger_details_on_page(merged, auto_continue=False)
-            if result.get("selected"):
-                await chat_server.send_to_browser(
-                    "Selected traveller(s) from checklist.",
-                    "status",
-                )
-            if result.get("filled"):
-                await chat_server.send_to_browser(
-                    "Passenger details entered on the page.",
-                    "status",
-                )
-
-            target_choice = state.get("cancellation_choice") or "no"
-            cancellation_ok = await _apply_cancellation_choice(state, target_choice, announce=False)
-            if not cancellation_ok:
-                await chat_server.send_to_browser(
-                    "I could not confirm cancellation option selection on page yet. Please select one option once, or reply 1/2/3 and I will retry.",
-                    "agent",
-                )
-                return True
-
-            advanced = await _click_booking_continue_on_page()
-            if advanced:
+            if result.get("advanced"):
                 state["stage"] = "done"
                 await chat_server.send_to_browser(
                     "Continue clicked. I moved to the next booking step.",
                     "agent",
                 )
             else:
-                await chat_server.send_to_browser(
-                    "I entered available details. If more fields are required, send remaining details and I will continue.",
-                    "agent",
-                )
+                merged = state.get("passenger_details") or {}
+                if not merged and not _looks_like_passenger_input(text):
+                    await chat_server.send_to_browser(
+                        "I need passenger details to continue: full name, email, mobile, and gender.",
+                        "agent",
+                    )
+                else:
+                    await chat_server.send_to_browser(
+                        "I entered available details and attempted to proceed. Share any missing field shown on page and I will continue.",
+                        "agent",
+                    )
             return True
 
     # Start or continue flow
@@ -1620,10 +2076,20 @@ async def handle_flight_chat_message(message: str) -> bool:
         )
 
     state = _merge_state(state, _extract_fields(text))
+    # Also capture passenger details if given in the same message
+    if _looks_like_passenger_input(text):
+        pd = _extract_passenger_details(text)
+        if pd:
+            existing_pd = state.get("passenger_details") or {}
+            state["passenger_details"] = {**existing_pd, **pd}
     missing_after_rules = _missing_fields(state)
     if missing_after_rules:
         # LLM reasoning fallback for ambiguous city/date phrasing.
-        llm_fields = await _llm_extract_fields(text)
+        llm_fields = await _llm_extract_fields(
+            text,
+            provider=chat_server.selected_provider,
+            model=chat_server.selected_model,
+        )
         if llm_fields:
             state = _merge_state(state, llm_fields)
 
@@ -1734,6 +2200,36 @@ async def handle_flight_chat_message(message: str) -> bool:
             "agent",
         )
         return True
+
+    # Pre-collect passenger details before navigating to Ixigo.
+    # This allows auto-filling the booking form without interruption.
+    existing_passenger = state.get("passenger_details") or {}
+    missing_passenger = [f for f in ["full_name", "email", "phone"] if not existing_passenger.get(f)]
+    if missing_passenger and not state.get("passenger_pre_prompted"):
+        state["passenger_pre_prompted"] = True
+        # Extract passenger details from current message if given
+        current_passenger = _extract_passenger_details(text)
+        if current_passenger:
+            state["passenger_details"] = {**existing_passenger, **current_passenger}
+            # Re-check
+            missing_passenger = [f for f in ["full_name", "email", "phone"] if not state["passenger_details"].get(f)]
+        if missing_passenger:
+            labels = {"full_name": "full name", "email": "email address", "phone": "mobile number"}
+            ask = ", ".join(labels[f] for f in missing_passenger)
+            await chat_server.send_to_browser(
+                f"I have your flight details. To book seamlessly, I also need passenger info: {ask}. "
+                "Please share now (or say 'skip' to provide later on the booking page).",
+                "agent",
+            )
+            return True
+
+    # If user said 'skip', clear the pre-prompt flag so we don't ask again
+    if text.strip().lower() == "skip":
+        state["passenger_pre_prompted"] = True
+        await chat_server.send_to_browser(
+            "OK, searching for flights now. I will ask for passenger details on the booking page.",
+            "status",
+        )
 
     # Run comparison
     fallback_url = build_ixigo_results_url(state)

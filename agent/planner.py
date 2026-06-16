@@ -56,7 +56,27 @@ Example:
   User: "buy milk and eggs"
   Plan: [{{"tool": "shop_all_platforms", "args": {{"query": "milk and eggs"}}}}]
 
-INSTRUCTIONS (for non-shopping tasks):
+BOOKING RULE:
+If the user says to book a ticket (flight, train, bus, hotel, movie, event) on any website,
+the booking assistant has already handled the interactive flow (collecting details, filling forms).
+In this case your job is to NAVIGATE to the specified website if not already there, or to
+help with any remaining navigation step. Use `navigate` with the website URL directly.
+Do NOT try to re-collect booking details — just open the page if needed.
+Example:
+  User: "book flight on makemytrip from pune to delhi"
+  Plan: [{{"tool": "navigate", "args": {{"url": "https://www.makemytrip.com/flights/"}}}}]
+
+DATE/FORM FILLING RULE:
+When you are on a booking page that has a date picker (calendar widget):
+- Use `select_calendar_date` with the ISO date (YYYY-MM-DD) to pick the date.
+- Use `wait_for_element` after navigation to confirm the page has loaded before interacting.
+- Use `evaluate_js` when buttons or inputs don't respond to normal click/type tools.
+- Use `list_interactive_elements` to discover what's visible on the page before acting.
+Example plan to fill a date picker:
+  [{{"tool": "wait_for_element", "args": {{"selector": "input, button", "timeout_ms": 5000}}}},
+   {{"tool": "select_calendar_date", "args": {{"target_date_iso": "2026-06-20"}}}}]
+
+INSTRUCTIONS (for non-shopping, non-booking tasks):
 1. Analyze the context and the user's goal.
 2. If the Feedback says "Success", output an empty plan [].
 3. Otherwise, create a sequence of actions (max 5 steps) to move towards the goal.

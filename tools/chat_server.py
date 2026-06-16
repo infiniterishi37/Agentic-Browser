@@ -66,6 +66,8 @@ class ChatServer:
             "auto_book": False,
             "options": [],
         }
+        # Universal booking assistant state (covers all sites/booking types).
+        self.universal_booking_state: Dict[str, Any] = {"active": False, "stage": "idle"}
 
     async def start(self) -> None:
         """Start the WebSocket server in the background."""
@@ -214,9 +216,12 @@ class ChatServer:
         finally:
             self._connections.discard(websocket)
 
-    async def send_to_browser(self, message: str, msg_type: str = "response") -> None:
+    async def send_to_browser(self, message: str, msg_type: str = "response", requires_input: bool = False) -> None:
         """Push a message to all connected browser chat widgets."""
-        payload = {"type": msg_type, "content": message}
+        payload: dict = {"type": msg_type, "content": message}
+        # Agent messages always need user input — auto-flag them for the beep sound
+        if requires_input or msg_type == "agent":
+            payload["requires_input"] = True
         await self._broadcast_payload(payload)
 
     async def _broadcast_payload(self, payload: Dict[str, Any]) -> None:

@@ -621,9 +621,9 @@ CHAT_WIDGET_JS = """
                         renderState();
                         return;
                     }
-                    addMessage(data.content, data.type || 'agent');
+                    addMessage(data.content, data.type || 'agent', Boolean(data.requires_input));
                 } catch(e) {
-                    addMessage(evt.data, 'agent');
+                    addMessage(evt.data, 'agent', false);
                 }
             };
             ws.onclose = () => {
@@ -635,12 +635,33 @@ CHAT_WIDGET_JS = """
         } catch(e) {}
     }
 
-    function addMessage(text, type) {
+    function playBeep() {
+        try {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(880, ctx.currentTime);
+            gain.gain.setValueAtTime(0.18, ctx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35);
+            osc.start(ctx.currentTime);
+            osc.stop(ctx.currentTime + 0.35);
+            osc.onended = () => ctx.close();
+        } catch(e) {}
+    }
+
+    function addMessage(text, type, requiresInput) {
         if (type === 'response') type = 'agent';
 
         const div = document.createElement('div');
         div.className = 'agentic-msg ' + type;
         div.textContent = text;
+        if (requiresInput) {
+            div.style.borderLeft = '3px solid #f59e0b';
+            div.style.paddingLeft = '8px';
+        }
         msgs.appendChild(div);
         msgs.scrollTop = msgs.scrollHeight;
         if (type === 'agent' || type === 'system' || type === 'status') {
@@ -648,6 +669,10 @@ CHAT_WIDGET_JS = """
             if (autoTtsCheckbox.checked) {
                 speakText(lastAgentMessage);
             }
+        }
+        // Beep when agent is asking user for input
+        if (requiresInput || type === 'agent') {
+            playBeep();
         }
         if (!isPanelOpen && type !== 'user') {
             setUnreadBadge(true);
@@ -995,6 +1020,155 @@ class BrowserManager:
             return f"Scrolled down by {amount} pixels"
         except Exception as e:
             return f"Error scrolling: {str(e)}"
+
+    async def evaluate_js(self, js_code: str) -> str:
+        """Evaluate JavaScript on the current page and return the result."""
+        if not self.page:
+            return "Error: No active page"
+        try:
+            result = await self.page.evaluate(js_code)
+            return f"JS Result: {str(result)[:800]}"
+        except Exception as e:
+            return f"Error evaluating JS: {str(e)}"
+
+    async def wait_for_element(self, selector: str, timeout_ms: int = 5000) -> str:
+        """Wait for an element matching the CSS selector to become visible."""
+        if not self.page:
+            return "Error: No active page"
+        try:
+            await self.page.wait_for_selector(selector, timeout=timeout_ms, state="visible")
+            return f"Element '{selector}' is now visible."
+        except Exception as e:
+            return f"Element '{selector}' not found within {timeout_ms}ms: {str(e)}"
+
+    async def select_calendar_date(self, target_date_iso: str) -> str:
+        """
+        Select a date from a calendar/datepicker widget visible on the page.
+        Navigates month-by-month until the target month is shown, then clicks the day.
+        target_date_iso must be YYYY-MM-DD format.
+        """
+        if not self.page:
+            return "Error: No active page"
+        try:
+            from datetime import datetime as _dt
+            target = _dt.strptime(target_date_iso, "%Y-%m-%d")
+        except ValueError:
+            return f"Invalid date format '{target_date_iso}'. Use YYYY-MM-DD."
+
+        year, month, day = target.year, target.month, target.day
+        month_names = [
+            "", "january", "february", "march", "april", "may", "june",
+            "july", "august", "september", "october", "november", "december",
+        ]
+        month_short = [
+            "", "jan", "feb", "mar", "apr", "may", "jun",
+            "jul", "aug", "sep", "oct", "nov", "dec",
+        ]
+        target_month_lower = month_names[month]
+        target_month_short = month_short[month]
+
+        # Navigate to the right month
+        for _attempt in range(24):
+            await asyncio.sleep(0.35)
+            try:
+                header: str = await self.page.evaluate(
+                    """() => {
+                        const inChat = el => !!el.closest('#agentic-chat-root');
+                        const isVisible = el => {
+                            if (!el || inChat(el)) return false;
+                            const r = el.getBoundingClientRect();
+                            const cs = window.getComputedStyle(el);
+                            return r.width > 0 && r.height > 0 && cs.display !== 'none';
+                        };
+                        const calSels = [
+                            '.DayPicker','[class*="calendar"]','[class*="Calendar"]',
+                            '[class*="datepicker"]','[class*="DatePicker"]',
+                            '[class*="picker"]','[role="dialog"]'
+                        ];
+                        let cal = null;
+                        for (const s of calSels) {
+                            const els = Array.from(document.querySelectorAll(s)).filter(el=>isVisible(el));
+                            if (els.length){cal=els[0];break;}
+                        }
+                        if (!cal) return '';
+                        const hdrs = Array.from(cal.querySelectorAll(
+                            '[class*="caption"],[class*="header"],[class*="Header"],caption,.DayPicker-Caption'
+                        )).filter(isVisible);
+                        return hdrs.map(el=>(el.innerText||el.textContent||'').trim()).join(' ');
+                    }"""
+                )
+            except Exception:
+                header = ""
+
+            header_lower = (header or "").lower()
+            if (target_month_lower in header_lower or target_month_short in header_lower) and str(year) in header_lower:
+                break  # On the right month
+
+            # Click next-month button
+            try:
+                await self.page.evaluate(
+                    """() => {
+                        const inChat = el => !!el.closest('#agentic-chat-root');
+                        const isVisible = el => {
+                            if (!el||inChat(el)) return false;
+                            const r = el.getBoundingClientRect();
+                            const cs = window.getComputedStyle(el);
+                            return r.width>0&&r.height>0&&cs.display!=='none';
+                        };
+                        const calSels=['[class*="calendar"]','[class*="Calendar"]','[class*="datepicker"]','[class*="picker"]','[role="dialog"]'];
+                        let cal=null;
+                        for(const s of calSels){const els=Array.from(document.querySelectorAll(s)).filter(el=>isVisible(el));if(els.length){cal=els[0];break;}}
+                        if(!cal)cal=document.body;
+                        const nextPats=['[aria-label*="next month" i]','button[class*="next" i]','[class*="next-month"]','[class*="navNext"]'];
+                        for(const p of nextPats){const el=cal.querySelector(p);if(el&&isVisible(el)){el.click();return;}}
+                        const btns=Array.from(cal.querySelectorAll('button')).filter(isVisible);
+                        const arrowBtns=btns.filter(b=>{const t=(b.innerText||b.textContent||'').trim();return['>','›','→','▶','»','Next'].includes(t);});
+                        if(arrowBtns.length){arrowBtns[0].click();return;}
+                        if(btns.length>=2)btns[btns.length-1].click();
+                    }"""
+                )
+            except Exception:
+                pass
+
+        # Click the target day
+        try:
+            clicked: bool = await self.page.evaluate(
+                """(d) => {
+                    const inChat = el => !!el.closest('#agentic-chat-root');
+                    const isVisible = el => {
+                        if(!el||inChat(el))return false;
+                        const r=el.getBoundingClientRect();
+                        const cs=window.getComputedStyle(el);
+                        return r.width>0&&r.height>0&&cs.display!=='none'&&cs.visibility!=='hidden';
+                    };
+                    const calSels=['.DayPicker','[class*="calendar"]','[class*="Calendar"]','[class*="datepicker"]','[class*="picker"]','[role="dialog"]','table'];
+                    let cal=null;
+                    for(const s of calSels){const els=Array.from(document.querySelectorAll(s)).filter(el=>isVisible(el));if(els.length){cal=els[0];break;}}
+                    if(!cal)cal=document.body;
+                    const cellSels=['[role="gridcell"]','[class*="day"]:not([class*="name"]):not([class*="header"])','td','[class*="date-cell"]'];
+                    for(const sel of cellSels){
+                        const cells=Array.from(cal.querySelectorAll(sel)).filter(isVisible);
+                        for(const cell of cells){
+                            const txt=(cell.innerText||cell.textContent||'').trim();
+                            if(parseInt(txt)!==d)continue;
+                            const cls=(cell.className||'').toString().toLowerCase();
+                            if(cell.hasAttribute('disabled')||cell.getAttribute('aria-disabled')==='true')continue;
+                            if(cls.includes('disabled')||cls.includes('prev-month')||cls.includes('next-month')||cls.includes('outside')||cls.includes('past'))continue;
+                            cell.scrollIntoView({block:'center'});
+                            cell.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }""",
+                day,
+            )
+            if clicked:
+                return f"Selected {target_date_iso} on the calendar."
+            return f"Could not find day {day} in the visible calendar for {target_date_iso}."
+        except Exception as e:
+            return f"Error clicking calendar day: {str(e)}"
+
 
 # Global instance
 browser_manager = BrowserManager()

@@ -44,6 +44,31 @@ TOOL_CONFIG = {
     "scroll": {
         "func": browser_manager.scroll,
         "desc": "Scrolls the page down (args: amount=500)."
-    }
+    },
+    "evaluate_js": {
+        "func": browser_manager.evaluate_js,
+        "desc": (
+            "Evaluates JavaScript on the current page and returns the result. "
+            "Useful for reading DOM state, clicking elements by complex logic, or "
+            "filling inputs that don't respond to normal selectors. (args: js_code='...')"
+        ),
+    },
+    "wait_for_element": {
+        "func": browser_manager.wait_for_element,
+        "desc": (
+            "Waits for a CSS-selector-matched element to become visible on the page. "
+            "Use after navigation or actions that trigger async rendering. "
+            "(args: selector='...', timeout_ms=5000)"
+        ),
+    },
+    "select_calendar_date": {
+        "func": browser_manager.select_calendar_date,
+        "desc": (
+            "Selects a date from a visible calendar/datepicker widget on the page. "
+            "Navigates month by month until the target is visible, then clicks the day. "
+            "Use this whenever you need to pick a date on a booking form. "
+            "(args: target_date_iso='YYYY-MM-DD')"
+        ),
+    },
 }
 

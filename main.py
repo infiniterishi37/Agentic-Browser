@@ -11,6 +11,7 @@ from graph import app
 from tools.browser import browser_manager
 from tools.chat_server import chat_server
 from tools.flights.assistant import handle_flight_chat_message
+from tools.booking.universal import handle_universal_booking
 from orchestration.engine import orchestration_engine
 
 # Load environment variables
@@ -244,6 +245,11 @@ async def run_agent():
                 if chat_msg:
                     last_activity_ts = time.monotonic()
                     print(f"\n💬 [Chat Message]: {chat_msg}")
+                    # Universal booking handler first (non-Ixigo sites, trains, buses, hotels, events)
+                    handled = await handle_universal_booking(chat_msg.get("content", ""))
+                    if handled:
+                        continue
+                    # Ixigo flight handler (default flight booking)
                     handled = await handle_flight_chat_message(chat_msg.get("content", ""))
                     if handled:
                         continue
