@@ -535,24 +535,62 @@ async def _resume_after_login(state: dict) -> None:
 
 
 async def _handle_provider_page_after_open(state: dict) -> None:
-    await asyncio.sleep(1.5)
+    """Called right after a flight option is clicked. Immediately starts the autonomous booking loop."""
+    await _auto_book_after_selection(state)
+
+
+async def _auto_book_after_selection(state: dict) -> None:
+    """
+    Drives the autonomous post-selection booking flow:
+      1. Wait for provider page to load.
+      2. Hand off to human if login is required.
+      3. Auto-fill passenger details, skip add-ons, click through every step.
+      4. Stop and notify user when payment page is reached.
+    """
+    await asyncio.sleep(2.5)
+
     if await _is_login_gate_visible():
         await _enter_human_login_handoff(state, resume_action="resume_continue")
         return
 
     state["topic"] = "execution"
     state["stage"] = "provider_ready"
-    advanced = await _attempt_post_login_proceed_click()
-    if advanced:
+
+    await chat_server.send_to_browser(
+        "Booking page is open. Starting autonomous booking — filling details and progressing through steps...",
+        "status",
+    )
+
+    result = await _auto_progress_provider_flow(state, user_message="")
+
+    if result.get("payment_reached"):
+        return  # message already sent inside the loop
+
+    if result.get("asked_user"):
+        return  # message already sent by the step that asked
+
+    if result.get("advanced"):
+        state["stage"] = "done"
         await chat_server.send_to_browser(
-            "I clicked Continue on the provider page. Share passenger details and I will fill them.",
+            "I progressed through booking steps. Continuing to next step...",
             "status",
         )
         return
-    await chat_server.send_to_browser(
-        "Provider page is open and ready. Share passenger details in chat and I will continue booking.",
-        "agent",
-    )
+
+    # Could not advance — ask for passenger details if we don't have them
+    merged = state.get("passenger_details") or {}
+    if not merged:
+        await chat_server.send_to_browser(
+            "Booking page is ready. Please share passenger details (full name, email, mobile number) "
+            "and I will fill them and proceed automatically.",
+            "agent",
+        )
+    else:
+        await chat_server.send_to_browser(
+            "I entered available details and attempted to proceed. "
+            "Share any missing field visible on the booking page and I will continue.",
+            "agent",
+        )
 
 
 def _extract_passenger_details(text: str) -> dict:
@@ -975,6 +1013,10 @@ async def _llm_plan_provider_actions(
         )
         snapshot = await _get_provider_page_snapshot()
         history_text = _compact_chat_history(limit=int(os.getenv("FLIGHT_HISTORY_LINES", "40")))
+        payment_signals = ["card number", "cvv", "upi", "net banking", "debit card", "credit card", "pay now", "make payment"]
+        page_excerpt_lower = (snapshot.get("excerpt") or "").lower()
+        is_payment_page = any(sig in page_excerpt_lower for sig in payment_signals)
+
         prompt = (
             "You are a flight-booking planner for an autonomous browser agent.\n"
             "Given current page state and chat context, return a short action plan to execute NOW.\n"
@@ -986,10 +1028,15 @@ async def _llm_plan_provider_actions(
             "}\n"
             "Rules:\n"
             "- Max 4 actions.\n"
-            "- Prefer progressing without asking user unless mandatory details are missing.\n"
-            "- On Add-ons/Seat/Meal pages, prefer click_continue.\n"
-            "- If visible contact fields and data exists, include fill_details before click_continue.\n"
-            "- If cancellation options are visible, include select_cancellation with 'no' unless user asked otherwise.\n"
+            "- PAYMENT PAGE: If page contains card number / CVV / UPI / Net Banking fields, return ONLY [{\"action\":\"ask_user\",\"message\":\"payment_reached\"}].\n"
+            "- LOGIN PAGE: If page contains OTP / password / mobile login fields, return [{\"action\":\"ask_user\",\"message\":\"login_required\"}].\n"
+            "- ADD-ON / UPSELL PAGES (seat selection, meal, travel insurance, baggage, cab, hotel upsell): "
+            "return click_continue with a visible skip/no-thanks/proceed button text.\n"
+            "- CANCELLATION SECTION: if 'free cancellation' options visible, include select_cancellation with 'no' by default.\n"
+            "- PASSENGER FORM: if name/email/phone inputs are visible and empty and details are available, include fill_details then click_continue.\n"
+            "- REVIEW / SUMMARY PAGE: if a 'Confirm', 'Continue', 'Proceed to Payment' button is visible, return click_continue.\n"
+            "- Prefer progressing without asking user unless mandatory details are truly missing.\n"
+            f"Is payment page (auto-detected): {is_payment_page}\n"
             f"Current user message: {user_message}\n"
             f"State stage: {state.get('stage', '')}\n"
             f"State cancellation_choice: {state.get('cancellation_choice', '')}\n"
@@ -1067,9 +1114,10 @@ def _plan_requires_user(plan: list[dict]) -> bool:
 async def _auto_progress_provider_flow(state: dict, user_message: str) -> dict:
     """
     Repeatedly scrape->plan->execute until blocked or iteration cap.
-    Stops only when user input is required or no forward movement is possible.
+    Stops at: payment page, login gate, genuine missing data, or after max_iters.
+    After every fill_details step, always attempts click_continue immediately.
     """
-    max_iters = int(os.getenv("FLIGHT_AUTO_PROGRESS_ITERS", "6"))
+    max_iters = int(os.getenv("FLIGHT_AUTO_PROGRESS_ITERS", "15"))
     if max_iters < 1:
         max_iters = 1
 
@@ -1077,8 +1125,33 @@ async def _auto_progress_provider_flow(state: dict, user_message: str) -> dict:
     any_filled = False
     any_selected = False
     asked_user = False
+    payment_reached = False
+    consecutive_no_progress = 0
 
-    for _ in range(max_iters):
+    payment_signals = [
+        "card number", "cvv", "upi", "net banking", "debit card",
+        "credit card", "pay now", "make payment", "payment method",
+    ]
+
+    for iteration in range(max_iters):
+        # ── Payment page fast-path (no LLM call needed) ──────────────────────
+        snapshot_quick = await _get_provider_page_snapshot()
+        excerpt_lower = (snapshot_quick.get("excerpt") or "").lower()
+        if any(sig in excerpt_lower for sig in payment_signals):
+            payment_reached = True
+            state["stage"] = "done"
+            await chat_server.send_to_browser(
+                "\U0001f4b3 Payment page reached! Please complete payment here to finalise your booking.",
+                "agent",
+            )
+            break
+
+        # ── Login gate fast-path ─────────────────────────────────────────────
+        if await _is_login_gate_visible():
+            await _enter_human_login_handoff(state, resume_action="resume_continue")
+            asked_user = True
+            break
+
         merged = _merge_passenger_state(state, user_message)
         plan = await _llm_plan_provider_actions(
             user_message=user_message,
@@ -1088,7 +1161,22 @@ async def _auto_progress_provider_flow(state: dict, user_message: str) -> dict:
         if not plan:
             plan = [{"action": "fill_details"}, {"action": "click_continue"}]
 
+        # ── Intercept LLM ask_user for special signals ───────────────────────
         if _plan_requires_user(plan):
+            # Check if it's a payment or login signal from LLM
+            for step in plan:
+                msg = str(step.get("message", "")).lower()
+                if "payment_reached" in msg:
+                    payment_reached = True
+                    state["stage"] = "done"
+                    await chat_server.send_to_browser(
+                        "\U0001f4b3 Payment page reached! Please complete payment to finalise your booking.",
+                        "agent",
+                    )
+                    break
+                if "login_required" in msg:
+                    await _enter_human_login_handoff(state, resume_action="resume_continue")
+                    break
             asked_user = True
             break
 
@@ -1096,28 +1184,47 @@ async def _auto_progress_provider_flow(state: dict, user_message: str) -> dict:
         any_advanced = any_advanced or bool(result.get("advanced"))
         any_filled = any_filled or bool(result.get("filled"))
         any_selected = any_selected or bool(result.get("selected"))
+
         if result.get("asked_user"):
             asked_user = True
             break
 
-        # Keep trying to auto-apply default cancellation when relevant.
+        # ── After fill_details, always try click_continue immediately ─────────
+        if result.get("filled") and not result.get("advanced"):
+            await asyncio.sleep(0.6)
+            # Also try cancellation before continuing
+            if not state.get("cancellation_applied"):
+                await _apply_cancellation_choice(state, state.get("cancellation_choice") or "no", announce=False)
+            advanced_now = await _click_booking_continue_on_page()
+            if advanced_now:
+                any_advanced = True
+                result["advanced"] = True
+                await chat_server.send_to_browser("Details entered and moved to next step.", "status")
+
+        # ── Auto-apply cancellation choice silently ───────────────────────────
         if not state.get("cancellation_applied"):
             target_choice = state.get("cancellation_choice") or "no"
             await _apply_cancellation_choice(state, target_choice, announce=False)
 
-        # If we progressed a page, run another iteration with fresh scrape.
-        if any_advanced:
-            await asyncio.sleep(0.9)
+        # ── Progress tracking ─────────────────────────────────────────────────
+        if result.get("advanced"):
+            consecutive_no_progress = 0
+            await asyncio.sleep(1.2)
             continue
 
-        # No forward progress this iteration, stop loop.
-        break
+        # No forward progress this iteration
+        consecutive_no_progress += 1
+        if consecutive_no_progress >= 2:
+            # Genuinely stuck — stop and let the caller decide
+            break
+        await asyncio.sleep(0.5)
 
     return {
         "advanced": any_advanced,
         "filled": any_filled,
         "selected": any_selected,
         "asked_user": asked_user,
+        "payment_reached": payment_reached,
     }
 
 
