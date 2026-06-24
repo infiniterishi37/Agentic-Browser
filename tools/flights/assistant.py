@@ -38,7 +38,7 @@ def _default_state() -> dict:
         "trip_type": "oneway",
         "adults": 1,
         "auto_book": False,
-        "book_cheapest": False,
+        "book_cheapest": True,   # always auto-select cheapest by default
         "login_prompted": False,
         "post_login_action": "",
         "pending_option": {},
@@ -46,9 +46,11 @@ def _default_state() -> dict:
         "passenger_details": {},
         "selected_travellers": [],
         "cancellation_prompted": False,
-        "cancellation_choice": "",  # no | free | flex
+        "cancellation_choice": "no",  # default: option 3 — no cancellation
         "cancellation_applied": False,
-        "passenger_pre_prompted": False,  # whether we already asked for passenger details upfront
+        "passenger_pre_prompted": False,
+        "passenger_prompted": False,   # whether we asked for passenger details on the booking page
+        "awaiting_passenger_fields": [],  # specific fields still needed
     }
 
 
@@ -542,17 +544,94 @@ async def _handle_provider_page_after_open(state: dict) -> None:
 
     state["topic"] = "execution"
     state["stage"] = "provider_ready"
-    advanced = await _attempt_post_login_proceed_click()
-    if advanced:
+
+    # Auto-apply cancellation option 3 (no cancellation) silently
+    if not state.get("cancellation_applied"):
+        await _apply_cancellation_choice(state, state.get("cancellation_choice") or "no", announce=False)
         await chat_server.send_to_browser(
-            "I clicked Continue on the provider page. Share passenger details and I will fill them.",
+            "Cancellation option 3 (No cancellation) selected automatically.",
             "status",
         )
-        return
-    await chat_server.send_to_browser(
-        "Provider page is open and ready. Share passenger details in chat and I will continue booking.",
-        "agent",
-    )
+
+    # Now ask user for passenger details — specify exactly what's needed
+    await _ask_for_missing_passenger_fields(state)
+
+
+async def _ask_for_missing_passenger_fields(
+    state: dict,
+    specific_fields: list[str] | None = None,
+) -> None:
+    """
+    Ask the user for passenger details, requesting only what is missing.
+    `specific_fields` overrides the auto-detect (used when re-asking after partial fill).
+    Sets state['passenger_prompted'] = True so we don't repeat unnecessarily.
+    """
+    state["passenger_prompted"] = True
+    current_pd = state.get("passenger_details") or {}
+    required = specific_fields or ["full_name", "email", "phone"]
+    missing = [f for f in required if not current_pd.get(f)]
+    labels = {
+        "full_name": "full name",
+        "email": "email address",
+        "phone": "mobile number",
+        "gender": "gender (male/female)",
+    }
+    if missing:
+        state["awaiting_passenger_fields"] = missing
+        ask = ", ".join(labels.get(f, f) for f in missing)
+        await chat_server.send_to_browser(
+            f"Please share your passenger details: {ask}.",
+            "agent",
+        )
+    else:
+        # All details already available — nothing to ask, caller should proceed
+        state["awaiting_passenger_fields"] = []
+
+
+async def _detect_empty_required_fields() -> list[str]:
+    """
+    Inspect the live booking page and return a list of our field-name keys
+    (full_name, email, phone, gender) that appear as visible empty required inputs.
+    """
+    page = browser_manager.page
+    if not page:
+        return []
+    try:
+        result = await page.evaluate(
+            """() => {
+                const isVisible = (el) => {
+                    const cs = window.getComputedStyle(el);
+                    if (!cs || cs.display === 'none' || cs.visibility === 'hidden') return false;
+                    const r = el.getBoundingClientRect();
+                    return !!r && r.width > 8 && r.height > 8;
+                };
+                const norm = (v) => String(v || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\\s+/g, ' ').trim();
+                const inputs = Array.from(document.querySelectorAll('input, textarea')).filter(isVisible);
+                const missing = new Set();
+                for (const el of inputs) {
+                    if (el.closest('#agentic-chat-root')) continue;
+                    if (String(el.value || '').trim()) continue;  // already filled
+                    const hay = [
+                        el.getAttribute('name') || '',
+                        el.getAttribute('id') || '',
+                        el.getAttribute('placeholder') || '',
+                        el.getAttribute('aria-label') || '',
+                        el.labels && el.labels[0] ? (el.labels[0].innerText || '') : '',
+                    ].join(' ').toLowerCase();
+
+                    if (/email|e-mail/.test(hay)) { missing.add('email'); continue; }
+                    if (/phone|mobile|contact|tel/.test(hay)) { missing.add('phone'); continue; }
+                    if (/first|fname|given/.test(hay) || /last|lname|surname/.test(hay) || /full.?name|passenger.?name/.test(hay)) {
+                        missing.add('full_name'); continue;
+                    }
+                    if (/gender|title/.test(hay)) { missing.add('gender'); continue; }
+                }
+                return Array.from(missing);
+            }"""
+        )
+        return result if isinstance(result, list) else []
+    except Exception:
+        return []
 
 
 def _extract_passenger_details(text: str) -> dict:
@@ -1064,60 +1143,202 @@ def _plan_requires_user(plan: list[dict]) -> bool:
     return False
 
 
+async def _click_booking_step(
+    page,
+    label: str,
+    text_variants: list,
+    exclude: list,
+) -> bool:
+    """
+    Playwright-based click for a single hardcoded booking step.
+    Searches the full page (not restricted to panels) for the first visible
+    button/link whose text matches one of `text_variants` and does NOT contain
+    any word in `exclude`.  Sends a status message on success.
+    """
+    exclude_lower = [e.lower() for e in exclude]
+
+    async def try_el(el) -> bool:
+        try:
+            if not await el.is_visible(timeout=500):
+                return False
+            inner = (await el.inner_text()).strip()
+            if not inner or len(inner) > 80:
+                return False
+            inner_lower = inner.lower()
+            if any(ex in inner_lower for ex in exclude_lower):
+                return False
+            await el.scroll_into_view_if_needed()
+            await el.click(timeout=3000)
+            await chat_server.send_to_browser(
+                f"Booking progress: clicked '{inner}' ({label}).",
+                "status",
+            )
+            return True
+        except Exception:
+            return False
+
+    for text in text_variants:
+        # 1. Playwright role-based locator (most reliable for native buttons)
+        try:
+            loc = page.get_by_role("button", name=text, exact=False)
+            count = await loc.count()
+            for i in range(count):
+                if await try_el(loc.nth(i)):
+                    return True
+        except Exception:
+            pass
+        # 2. Any standard clickable element containing the text
+        try:
+            loc = page.locator("button, a, [role='button']").filter(has_text=text)
+            count = await loc.count()
+            for i in range(count):
+                if await try_el(loc.nth(i)):
+                    return True
+        except Exception:
+            pass
+        # 3. React/custom-rendered elements (div, span) — common in Ixigo side panels.
+        #    try_el's 80-char inner_text limit filters out parent containers.
+        try:
+            loc = page.locator("div, span").filter(has_text=text)
+            count = await loc.count()
+            for i in range(count):
+                if await try_el(loc.nth(i)):
+                    return True
+        except Exception:
+            pass
+
+    return False
+
+
 async def _auto_progress_provider_flow(state: dict, user_message: str) -> dict:
     """
-    Repeatedly scrape->plan->execute until blocked or iteration cap.
-    Stops only when user input is required or no forward movement is possible.
-    """
-    max_iters = int(os.getenv("FLIGHT_AUTO_PROGRESS_ITERS", "6"))
-    if max_iters < 1:
-        max_iters = 1
+    Hardcoded sequential booking flow (Playwright-based, no JS state machine):
+      Start : Passenger details already filled
+      Step 1: Check 'No Cancellation' option
+      Step 2: Click main 'Continue' button
+      Step 3: Click 'Confirm' on the side panel modal
+      Step 4: Click 'No, Thanks' in the updated side panel
+      Step 5: Click 'Meal Selection' once the page opens
+      Step 6: Click 'Continue' 1st time
+      Step 7: Click 'Continue' 2nd time
+      Step 8: Click 'Continue' 3rd time
+      Step 9: Click 'Continue to Pay' in the side panel → stop
 
+    Rules:
+    - Always wait 2s before every click attempt.
+    - Each step uses Playwright locators on the full page (not panel-restricted).
+    - If the button is not found, retry the same step up to 3 more times (4 total),
+      each with a 2s wait.  If all 4 attempts fail, stop the flow.
+    - Verify each click via the Playwright click return; only advance on success.
+    """
     any_advanced = False
     any_filled = False
     any_selected = False
-    asked_user = False
 
-    for _ in range(max_iters):
-        merged = _merge_passenger_state(state, user_message)
-        plan = await _llm_plan_provider_actions(
-            user_message=user_message,
-            state=state,
-            merged_details=merged,
-        )
-        if not plan:
-            plan = [{"action": "fill_details"}, {"action": "click_continue"}]
+    page = browser_manager.page
+    if not page:
+        return {"advanced": False, "filled": False, "selected": False, "asked_user": False}
 
-        if _plan_requires_user(plan):
-            asked_user = True
+    # Fill passenger details if the form is currently visible
+    merged = _merge_passenger_state(state, user_message)
+    fill_res = await _fill_passenger_details_on_page(merged, auto_continue=False)
+    if fill_res.get("filled"):
+        any_filled = True
+    if fill_res.get("selected"):
+        any_selected = True
+
+    # Step 1: Select 'No Cancellation'
+    cancel_choice = state.get("cancellation_choice") or "no"
+    cancel_ok = await _apply_cancellation_choice(state, cancel_choice, announce=False)
+    if cancel_ok:
+        any_selected = True
+
+    # Steps 2-9: (label, text_variants, exclude_words, is_final_step)
+    # exclude_words prevents accidentally clicking pay/skip/fee buttons at wrong steps.
+    BOOKING_STEPS = [
+        (
+            "passenger_continue",
+            ["Continue", "Proceed", "Next"],
+            ["pay", "to pay", "lock price", "skip", "fee"],
+            False,
+        ),
+        (
+            "confirm_panel",
+            ["Confirm", "Confirm Selection", "Confirm Details"],
+            ["pay", "to pay", "skip", "fee"],
+            False,
+        ),
+        (
+            "no_thanks_panel",
+            ["No, Thanks", "No Thanks", "No thank you", "Don't want",
+             "Dont want", "Not now", "Maybe later", "No I don't want"],
+            ["pay", "to pay", "payment", "fee"],
+            False,
+        ),
+        (
+            "meal_selection",
+            ["Meal Selection", "Add Meal", "Select Meal", "Choose Meal"],
+            ["pay", "to pay", "skip"],
+            False,
+        ),
+        (
+            "continue_1",
+            ["Continue", "Proceed", "Next"],
+            ["pay", "to pay", "lock price", "skip", "fee"],
+            False,
+        ),
+        (
+            "continue_2",
+            ["Continue", "Proceed", "Next"],
+            ["pay", "to pay", "lock price", "skip", "fee"],
+            False,
+        ),
+        (
+            "continue_3",
+            ["Continue", "Proceed", "Next"],
+            ["pay", "to pay", "lock price", "skip", "fee"],
+            False,
+        ),
+        (
+            "continue_to_pay",
+            ["Continue to Pay", "Proceed to Pay", "Proceed to Payment", "Continue to Payment"],
+            [],
+            True,
+        ),
+    ]
+
+    for label, texts, exclude, is_final in BOOKING_STEPS:
+        step_clicked = False
+
+        for attempt in range(4):  # 1 initial + 3 retries
+            await asyncio.sleep(2.0)  # Always wait 2s before every click
+
+            ok = await _click_booking_step(page, label, texts, exclude)
+            if ok:
+                any_advanced = True
+                step_clicked = True
+                if is_final:
+                    await chat_server.send_to_browser(
+                        "Flow stopped: 'Continue to Pay' clicked.",
+                        "status",
+                    )
+                    return {
+                        "advanced": any_advanced,
+                        "filled": any_filled,
+                        "selected": any_selected,
+                        "asked_user": False,
+                    }
+                break  # Click verified — advance to next step
+
+        if not step_clicked:
+            # Button not found after 4 attempts — stop the flow
             break
-
-        result = await _execute_provider_plan(state=state, merged_details=merged, plan=plan)
-        any_advanced = any_advanced or bool(result.get("advanced"))
-        any_filled = any_filled or bool(result.get("filled"))
-        any_selected = any_selected or bool(result.get("selected"))
-        if result.get("asked_user"):
-            asked_user = True
-            break
-
-        # Keep trying to auto-apply default cancellation when relevant.
-        if not state.get("cancellation_applied"):
-            target_choice = state.get("cancellation_choice") or "no"
-            await _apply_cancellation_choice(state, target_choice, announce=False)
-
-        # If we progressed a page, run another iteration with fresh scrape.
-        if any_advanced:
-            await asyncio.sleep(0.9)
-            continue
-
-        # No forward progress this iteration, stop loop.
-        break
 
     return {
         "advanced": any_advanced,
         "filled": any_filled,
         "selected": any_selected,
-        "asked_user": asked_user,
+        "asked_user": False,
     }
 
 
@@ -1253,6 +1474,9 @@ async def _select_cancellation_on_page(choice: str) -> bool:
                                 txt.includes("i don't want free cancellation")
                                 || txt.includes('do not want free cancellation')
                                 || txt.includes('dont want free cancellation')
+                                || txt.includes('no cancellation')
+                                || txt.includes('without cancellation')
+                                || txt.includes('risk')
                             ) found.push(el);
                         } else if (kind === 'flex') {
                             if (txt.includes('free cancellation + rescheduling') || txt.includes('rescheduling')) found.push(el);
@@ -1376,58 +1600,235 @@ async def _apply_cancellation_choice(state: dict, choice: str, announce: bool = 
     return False
 
 
-async def _click_booking_continue_on_page() -> bool:
+async def _click_booking_continue_on_page() -> dict:
+    """Unified booking progress helper. Detects the current page state/modal
+    and clicks the appropriate progress CTA:
+    - Main page: clicks standard 'Continue' first, then 'Meal Selection' later.
+    - Side panels: clicks 'Confirm' first, then 'No, Thanks', then 'Continue to Pay'.
+    """
     page = browser_manager.page
     if not page:
-        return False
-    side_actions = await _click_side_panel_sequence()
-    if side_actions:
-        return True
-    selectors = [
-        "button:text-is('Continue')",
-        "[role='button']:text-is('Continue')",
-        "a:text-is('Continue')",
-        "button:has-text('Continue')",
-        "[role='button']:has-text('Continue')",
-        "button:has-text('Proceed')",
-        "[role='button']:has-text('Proceed')",
-        "button:has-text('Next')",
-        "[role='button']:has-text('Next')",
-        "button:has-text('Meal Selection')",
-        "[role='button']:has-text('Meal Selection')",
-        "button:has-text('Skip')",
-        "[role='button']:has-text('Skip')",
-        "button:has-text('No Thanks')",
-        "[role='button']:has-text('No Thanks')",
-        "button:has-text('Payment')",
-        "[role='button']:has-text('Payment')",
-        "a:has-text('Payment')",
-    ]
-    for sel in selectors:
-        try:
-            loc = page.locator(sel)
-            count = await loc.count()
-            if count < 1:
-                continue
-            for i in range(min(count, 8)):
-                cand = loc.nth(i)
-                if not await cand.is_visible(timeout=500):
-                    continue
-                in_chat = await cand.evaluate(
-                    """(el) => !!el.closest('#agentic-chat-root')"""
-                )
-                if in_chat:
-                    continue
-                txt = (await cand.inner_text(timeout=500)).strip().lower()
-                if "lock price" in txt:
-                    continue
-                await cand.scroll_into_view_if_needed()
-                await cand.click(timeout=1800)
-                await asyncio.sleep(1.0)
-                return True
-        except Exception:
-            continue
-    return False
+        return {"clicked": False}
+    try:
+        result = await page.evaluate(
+            """async () => {
+                const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+                const isVisible = (el) => {
+                    const cs = window.getComputedStyle(el);
+                    if (!cs || cs.display === 'none' || cs.visibility === 'hidden' || Number(cs.opacity || '1') === 0) return false;
+                    const r = el.getBoundingClientRect();
+                    return !!r && r.width > 8 && r.height > 8;
+                };
+                const inChat = (el) => !!el.closest('#agentic-chat-root');
+                const norm = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, ' ').replace(/\\s+/g, ' ').trim();
+                const textOf = (el) => String(el.innerText || el.textContent || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+
+                const findBtn = (roots, keywords) => {
+                    for (const root of roots) {
+                        const btns = Array.from(root.querySelectorAll('button, a, [role="button"], span, div'))
+                            .filter(el => isVisible(el) && !inChat(el));
+                        for (const kw of keywords) {
+                            for (const btn of btns) {
+                                const text = textOf(btn);
+                                const t = norm(text);
+                                if (t && t.includes(kw) && text.length <= 50) {
+                                    if (t.includes('lock price')) continue;
+                                    if (t.includes('skip')) continue;
+                                    return btn;
+                                }
+                            }
+                        }
+                    }
+                    return null;
+                };
+
+                const findConfirmBtn = (roots) => {
+                    for (const root of roots) {
+                        const btns = Array.from(root.querySelectorAll('button, a, [role="button"], span, div'))
+                            .filter(el => isVisible(el) && !inChat(el));
+                        for (const btn of btns) {
+                            const text = textOf(btn);
+                            const t = norm(text);
+                            if (t && text.length <= 50) {
+                                if (t === 'confirm' || t.startsWith('confirm ') || t === 'confirm selection' || t === 'confirm details') {
+                                    return btn;
+                                }
+                            }
+                        }
+                    }
+                    return null;
+                };
+
+                const findPayBtn = (roots) => {
+                    for (const root of roots) {
+                        const btns = Array.from(root.querySelectorAll('button, a, [role="button"], span, div'))
+                            .filter(el => isVisible(el) && !inChat(el));
+                        for (const btn of btns) {
+                            const text = textOf(btn);
+                            const t = norm(text);
+                            if (t && text.length <= 50) {
+                                const isPay = t.includes('continue to pay') ||
+                                              t.includes('proceed to pay') ||
+                                              t.includes('proceed to payment') ||
+                                              t.includes('continue to payment') ||
+                                              t === 'pay now' ||
+                                              t === 'pay';
+                                const isNotPayBtn = t.includes('fee') || t.includes('cancel') || t.includes('reschedule') || t.includes('skip');
+                                if (isPay && !isNotPayBtn) {
+                                    return btn;
+                                }
+                            }
+                        }
+                    }
+                    return null;
+                };
+
+                const clickEl = async (el) => {
+                    if (!el) return false;
+                    try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (e) {}
+                    try {
+                        el.click();
+                    } catch (e) {
+                        try {
+                            el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                            el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                            el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                        } catch (e2) {
+                            return false;
+                        }
+                    }
+                    await sleep(600);
+                    return true;
+                };
+
+                // Get current state from sessionStorage
+                let step = sessionStorage.getItem('ixigo_booking_step') || 'start';
+
+                // Look for side panels
+                const panelRoots = Array.from(document.querySelectorAll(
+                    'aside, [role="dialog"], [aria-modal="true"], .drawer, .modal, .sidebar, .panel, [class*="side"], [class*="drawer"], [class*="panel"]'
+                )).filter(isVisible);
+
+                const confirmBtn = findConfirmBtn(panelRoots.length > 0 ? panelRoots : [document.body]);
+                const noThanksBtn = findBtn(panelRoots.length > 0 ? panelRoots : [document.body], ['no thanks', 'dont want']);
+                const mealBtn = findBtn([document.body], ['meal selection']);
+                const payBtn = findPayBtn(panelRoots.length > 0 ? panelRoots : [document.body]);
+                const continueBtn = findBtn([document.body], ['continue', 'proceed', 'next']);
+
+                if (step === 'start') {
+                    // Start by clicking the main passenger form Continue button
+                    if (continueBtn) {
+                        if (await clickEl(continueBtn)) {
+                            sessionStorage.setItem('ixigo_booking_step', 'continue_clicked');
+                            return { clicked: 'passenger_continue', text: textOf(continueBtn), stop_flow: false };
+                        }
+                    }
+                }
+
+                if (step === 'continue_clicked') {
+                    // Click Confirm in side panel
+                    if (confirmBtn) {
+                        if (await clickEl(confirmBtn)) {
+                            sessionStorage.setItem('ixigo_booking_step', 'confirm_clicked');
+                            return { clicked: 'confirm_side_panel', text: textOf(confirmBtn), stop_flow: false };
+                        }
+                    }
+                    // If side panel skip confirm and goes to no thanks directly
+                    if (noThanksBtn) {
+                        if (await clickEl(noThanksBtn)) {
+                            sessionStorage.setItem('ixigo_booking_step', 'no_thanks_clicked');
+                            return { clicked: 'no_thanks_side_panel', text: textOf(noThanksBtn), stop_flow: false };
+                        }
+                    }
+                }
+
+                if (step === 'confirm_clicked') {
+                    // Click No Thanks in side panel
+                    if (noThanksBtn) {
+                        if (await clickEl(noThanksBtn)) {
+                            sessionStorage.setItem('ixigo_booking_step', 'no_thanks_clicked');
+                            return { clicked: 'no_thanks_side_panel', text: textOf(noThanksBtn), stop_flow: false };
+                        }
+                    }
+                }
+
+                if (step === 'no_thanks_clicked') {
+                    if (mealBtn) {
+                        if (await clickEl(mealBtn)) {
+                            sessionStorage.setItem('ixigo_booking_step', 'meal_clicked');
+                            return { clicked: 'meal_selection', text: textOf(mealBtn), stop_flow: false };
+                        }
+                    } else {
+                        if (continueBtn) {
+                            if (await clickEl(continueBtn)) {
+                                sessionStorage.setItem('ixigo_booking_step', 'continue_1');
+                                return { clicked: 'continue_1', text: textOf(continueBtn), stop_flow: false };
+                            }
+                        }
+                    }
+                }
+
+                if (step === 'meal_clicked') {
+                    if (continueBtn) {
+                        if (await clickEl(continueBtn)) {
+                            sessionStorage.setItem('ixigo_booking_step', 'continue_1');
+                            return { clicked: 'continue_1', text: textOf(continueBtn), stop_flow: false };
+                        }
+                    }
+                }
+
+                if (step === 'continue_1') {
+                    if (continueBtn) {
+                        if (await clickEl(continueBtn)) {
+                            sessionStorage.setItem('ixigo_booking_step', 'continue_2');
+                            return { clicked: 'continue_2', text: textOf(continueBtn), stop_flow: false };
+                        }
+                    }
+                }
+
+                if (step === 'continue_2') {
+                    if (continueBtn) {
+                        if (await clickEl(continueBtn)) {
+                            sessionStorage.setItem('ixigo_booking_step', 'continue_3');
+                            return { clicked: 'continue_3', text: textOf(continueBtn), stop_flow: false };
+                        }
+                    }
+                }
+
+                if (step === 'continue_3' || step === 'continue_2' || step === 'continue_1') {
+                    if (payBtn) {
+                        if (await clickEl(payBtn)) {
+                            sessionStorage.setItem('ixigo_booking_step', 'pay_clicked');
+                            return { clicked: 'continue_to_pay', text: textOf(payBtn), stop_flow: true };
+                        }
+                    }
+                }
+
+                // Generic fallback if we get stuck or state is out of sync
+                if (payBtn) {
+                    if (await clickEl(payBtn)) {
+                        sessionStorage.setItem('ixigo_booking_step', 'pay_clicked');
+                        return { clicked: 'pay_fallback', text: textOf(payBtn), stop_flow: true };
+                    }
+                }
+                if (continueBtn) {
+                    if (await clickEl(continueBtn)) {
+                        return { clicked: 'continue_fallback', text: textOf(continueBtn), stop_flow: false };
+                    }
+                }
+
+                return null;
+            }"""
+        )
+        if result and isinstance(result, dict) and result.get("clicked"):
+            await chat_server.send_to_browser(
+                f"Booking progress: clicked '{result.get('text')}' ({result.get('clicked')}).",
+                "status",
+            )
+            return {"clicked": True, "stop_flow": bool(result.get("stop_flow"))}
+    except Exception:
+        pass
+    return {"clicked": False}
 
 
 async def _click_side_panel_sequence() -> list[str]:
@@ -1969,6 +2370,12 @@ async def handle_flight_chat_message(message: str) -> bool:
         _cancel_login_monitor()
         chat_server.flight_booking_state = _default_state()
         await chat_server.send_to_browser("Flight booking flow cancelled.", "system")
+        page = browser_manager.page
+        if page:
+            try:
+                await page.evaluate("sessionStorage.removeItem('ixigo_booking_step')")
+            except Exception:
+                pass
         return True
 
     is_intent = _is_flight_intent(text)
@@ -1980,6 +2387,12 @@ async def handle_flight_chat_message(message: str) -> bool:
         _cancel_login_monitor()
         state = _default_state()
         chat_server.flight_booking_state = state
+        page = browser_manager.page
+        if page:
+            try:
+                await page.evaluate("sessionStorage.removeItem('ixigo_booking_step')")
+            except Exception:
+                pass
 
     if state.get("stage") == "awaiting_login":
         if text.lower() in {"logged in", "i logged in", "done", "continue"}:
@@ -2029,9 +2442,9 @@ async def handle_flight_chat_message(message: str) -> bool:
             state = _default_state()
             chat_server.flight_booking_state = state
         else:
-            await _ensure_cancellation_prompt(state)
+            # Allow user to override cancellation choice
             cancellation_choice = _extract_cancellation_choice(text)
-            if cancellation_choice:
+            if cancellation_choice and cancellation_choice != state.get("cancellation_choice"):
                 picked = await _apply_cancellation_choice(state, cancellation_choice, announce=True)
                 if not picked:
                     label = {
@@ -2040,40 +2453,75 @@ async def handle_flight_chat_message(message: str) -> bool:
                         "no": "I don't want Free Cancellation",
                     }.get(cancellation_choice, "I don't want Free Cancellation")
                     await chat_server.send_to_browser(
-                        f"I noted your cancellation choice ({label}) but couldn't confirm the click yet.",
-                        "agent",
+                        f"Noted: {label}. I will apply it now.",
+                        "status",
                     )
-            result = await _auto_progress_provider_flow(state, text)
-            if result.get("asked_user"):
+
+            # Merge whatever passenger details user just sent
+            if _looks_like_passenger_input(text):
+                _merge_passenger_state(state, text)
+
+            # Determine which fields are still awaited
+            needed = state.get("awaiting_passenger_fields") or []
+            current_pd = state.get("passenger_details") or {}
+            still_missing = [f for f in needed if not current_pd.get(f)]
+
+            if still_missing:
+                # User provided some — try to fill what we have, then ask for the rest
+                merged = _merge_passenger_state(state, text)
+                await _fill_passenger_details_on_page(merged, auto_continue=False)
+                still_missing = [f for f in still_missing if not merged.get(f)]
+                if still_missing:
+                    await _ask_for_missing_passenger_fields(state, specific_fields=still_missing)
+                    return True
+                # All collected — try to proceed
+                state["awaiting_passenger_fields"] = []
+            elif not state.get("passenger_prompted"):
+                # Haven't asked yet — ask now
+                await _ask_for_missing_passenger_fields(state)
                 return True
+
+            # We have passenger details — fill page and proceed
+            merged = _merge_passenger_state(state, text)
+            fill_result = await _fill_passenger_details_on_page(merged, auto_continue=False)
+
+            # Check for any form fields on page that are still empty
+            page_missing = await _detect_empty_required_fields()
+            if page_missing:
+                state["awaiting_passenger_fields"] = page_missing
+                labels = {
+                    "full_name": "full name",
+                    "email": "email address",
+                    "phone": "mobile number",
+                    "gender": "gender (male/female)",
+                }
+                ask = ", ".join(labels.get(f, f) for f in page_missing)
+                await chat_server.send_to_browser(
+                    f"Some required fields are still empty: {ask}. Please share them and I will fill and continue.",
+                    "agent",
+                )
+                return True
+
+            # Everything filled — run auto-progress flow to fill details, check cancellation, click Continue, No thanks, Meals, and Pay.
+            result = await _auto_progress_provider_flow(state, text)
             if result.get("advanced"):
                 state["stage"] = "done"
                 await chat_server.send_to_browser(
-                    "Continue clicked. I moved to the next booking step.",
-                    "agent",
+                    "Details filled, cancellation choice checked, and progressed through subsequent steps to payment.",
+                    "status",
                 )
             else:
-                merged = state.get("passenger_details") or {}
-                if not merged and not _looks_like_passenger_input(text):
-                    await chat_server.send_to_browser(
-                        "I need passenger details to continue: full name, email, mobile, and gender.",
-                        "agent",
-                    )
-                else:
-                    await chat_server.send_to_browser(
-                        "I entered available details and attempted to proceed. Share any missing field shown on page and I will continue.",
-                        "agent",
-                    )
+                await chat_server.send_to_browser(
+                    "Details entered. If there's a Continue/Proceed button visible, I'll click it — or let me know what to do next.",
+                    "agent",
+                )
             return True
 
     # Start or continue flow
-    if not state.get("active"):
+    first_activation = not state.get("active")
+    if first_activation:
         state["active"] = True
         state["stage"] = "collecting"
-        await chat_server.send_to_browser(
-            "I can help with flight booking. Share details naturally, for example: Pune to Delhi on 18 May for 2 adults. I will handle city spellings and format everything correctly.",
-            "agent",
-        )
 
     state = _merge_state(state, _extract_fields(text))
     # Also capture passenger details if given in the same message
@@ -2092,6 +2540,13 @@ async def handle_flight_chat_message(message: str) -> bool:
         )
         if llm_fields:
             state = _merge_state(state, llm_fields)
+    # If this was the first activation and flight fields are still missing,
+    # now show the welcome/guidance message.
+    if first_activation and _missing_fields(state):
+        await chat_server.send_to_browser(
+            "I can help with flight booking. Share details naturally, for example: Pune to Delhi on 18 May for 2 adults. I will handle city spellings and format everything correctly.",
+            "agent",
+        )
 
     # If already compared, check choice
     if state.get("stage") == "compared":
@@ -2201,35 +2656,8 @@ async def handle_flight_chat_message(message: str) -> bool:
         )
         return True
 
-    # Pre-collect passenger details before navigating to Ixigo.
-    # This allows auto-filling the booking form without interruption.
-    existing_passenger = state.get("passenger_details") or {}
-    missing_passenger = [f for f in ["full_name", "email", "phone"] if not existing_passenger.get(f)]
-    if missing_passenger and not state.get("passenger_pre_prompted"):
-        state["passenger_pre_prompted"] = True
-        # Extract passenger details from current message if given
-        current_passenger = _extract_passenger_details(text)
-        if current_passenger:
-            state["passenger_details"] = {**existing_passenger, **current_passenger}
-            # Re-check
-            missing_passenger = [f for f in ["full_name", "email", "phone"] if not state["passenger_details"].get(f)]
-        if missing_passenger:
-            labels = {"full_name": "full name", "email": "email address", "phone": "mobile number"}
-            ask = ", ".join(labels[f] for f in missing_passenger)
-            await chat_server.send_to_browser(
-                f"I have your flight details. To book seamlessly, I also need passenger info: {ask}. "
-                "Please share now (or say 'skip' to provide later on the booking page).",
-                "agent",
-            )
-            return True
-
-    # If user said 'skip', clear the pre-prompt flag so we don't ask again
-    if text.strip().lower() == "skip":
-        state["passenger_pre_prompted"] = True
-        await chat_server.send_to_browser(
-            "OK, searching for flights now. I will ask for passenger details on the booking page.",
-            "status",
-        )
+    # Passenger details are collected at the booking stage (provider_ready),
+    # not upfront — go straight to Ixigo search.
 
     # Run comparison
     fallback_url = build_ixigo_results_url(state)
@@ -2286,6 +2714,12 @@ async def handle_flight_chat_message(message: str) -> bool:
             ]
     state["options"] = options
     state["stage"] = "compared"
+    page = browser_manager.page
+    if page:
+        try:
+            await page.evaluate("sessionStorage.removeItem('ixigo_booking_step')")
+        except Exception:
+            pass
 
     summary = [
         "Flight comparison is ready on Ixigo.",
@@ -2294,42 +2728,51 @@ async def handle_flight_chat_message(message: str) -> bool:
         f"Passengers: {state.get('adults', 1)} adult(s)",
     ]
     if options:
-        if state.get("book_cheapest"):
-            await chat_server.send_to_browser(
-                "You asked for cheapest flight, so I am now proceeding automatically.",
-                "status",
-            )
+        # Always auto-select cheapest by default
+        await chat_server.send_to_browser(
+            "Selecting the cheapest available flight automatically.",
+            "status",
+        )
+        result = await _attempt_cheapest_click()
+        await chat_server.send_to_browser(
+            (
+                "Cheapest flight selected."
+                f" Sorted: {'yes' if result.get('sorted') else 'no'}"
+                f", Clicked: {'yes' if result.get('clicked') else 'no'}."
+                + (" (fallback used)" if result.get("fallback_rank_click") else "")
+            ),
+            "status",
+        )
+        if result.get("clicked"):
+            await _handle_provider_page_after_open(state)
+        else:
+            if await _is_login_gate_visible():
+                await _enter_human_login_handoff(state, resume_action="resume_cheapest")
+            else:
+                state["stage"] = "compared"
+                # Show options as fallback so user can pick manually
+                summary.append("Could not auto-select. Please choose an option:")
+                for i, opt in enumerate(options, start=1):
+                    if opt.get("kind") == "external_url" and opt.get("url"):
+                        summary.append(f"{i}. {opt.get('label', 'Option')} — {opt.get('url')}")
+                    else:
+                        summary.append(f"{i}. {opt.get('label', 'Option')}")
+                summary.append("Tell me which one to proceed with, for example 'option 1'.")
+                await chat_server.send_to_browser("\n".join(summary), "agent")
+        return True
+    else:
+        summary.append("No clickable options found yet. Retrying...")
+        await chat_server.send_to_browser("\n".join(summary), "status")
+        # One retry after a short wait
+        await asyncio.sleep(3)
+        options = await _extract_clickable_ixigo_options()
+        if options:
             result = await _attempt_cheapest_click()
-            await chat_server.send_to_browser(
-                (
-                    "Cheapest option flow executed."
-                    f" Sorted: {'yes' if result.get('sorted') else 'no'}"
-                    f", Option clicked: {'yes' if result.get('clicked') else 'no'}."
-                    + (" (fallback click used)" if result.get("fallback_rank_click") else "")
-                ),
-                "agent",
-            )
             if result.get("clicked"):
                 await _handle_provider_page_after_open(state)
-            else:
-                if await _is_login_gate_visible():
-                    await _enter_human_login_handoff(state, resume_action="resume_cheapest")
-                else:
-                    state["stage"] = "compared"
-                    await chat_server.send_to_browser(
-                        "I could not click cheapest yet. I kept the results page active, so say 'select cheapest and proceed' to retry immediately.",
-                        "agent",
-                    )
-            return True
-        summary.append("Top booking options found:")
-        for i, opt in enumerate(options, start=1):
-            if opt.get("kind") == "external_url" and opt.get("url"):
-                summary.append(f"{i}. {opt.get('label', 'Option')} — {opt.get('url')}")
-            else:
-                summary.append(f"{i}. {opt.get('label', 'Option')}")
-        summary.append("Tell me which one to proceed with, for example 'option 1'.")
-    else:
-        summary.append("Results are loaded. Say 'book cheapest flight' or share the opened booking URL from the option you choose.")
-
-    await chat_server.send_to_browser("\n".join(summary), "agent")
+                return True
+        await chat_server.send_to_browser(
+            "Results loaded. Say 'book cheapest' to retry, or pick an option number if shown.",
+            "agent",
+        )
     return True
